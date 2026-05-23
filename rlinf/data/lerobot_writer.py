@@ -36,7 +36,7 @@ class LeRobotDatasetWriter:
         for episode_data in episodes:
             writer.add_episode(episode_data)
 
-        writer.finalize(push_to_hub=False)
+        writer.finalize()
     """
 
     def __init__(self):
@@ -99,10 +99,30 @@ class LeRobotDatasetWriter:
                     "shape": (action_dim,),
                     "names": ["actions"],
                 },
+                "next_state": {
+                    "dtype": "float32",
+                    "shape": (state_dim,),
+                    "names": ["next_state"],
+                },
+                "rewards": {
+                    "dtype": "float32",
+                    "shape": (1,),
+                    "names": ["rewards"],
+                },
                 "done": {
                     "dtype": "bool",
                     "shape": (1,),
                     "names": ["done"],
+                },
+                "terminated": {
+                    "dtype": "bool",
+                    "shape": (1,),
+                    "names": ["terminated"],
+                },
+                "truncated": {
+                    "dtype": "bool",
+                    "shape": (1,),
+                    "names": ["truncated"],
                 },
                 "is_success": {
                     "dtype": "bool",
@@ -130,6 +150,17 @@ class LeRobotDatasetWriter:
                             "shape": list(shape),
                             "names": ["height", "width", "channel"],
                         }
+                        features[f"next_{key}"] = {
+                            "dtype": "image",
+                            "shape": list(shape),
+                            "names": ["height", "width", "channel"],
+                        }
+            if has_image:
+                features["next_image"] = {
+                    "dtype": "image",
+                    "shape": list(image_shape),
+                    "names": ["height", "width", "channel"],
+                }
 
         self.logger.info(
             f"Creating LeRobot dataset: repo_id={repo_id}, robot_type={robot_type}, fps={fps}"
@@ -148,17 +179,13 @@ class LeRobotDatasetWriter:
         Add an episode to the dataset.
 
         Args:
-            episode_data: List of frame dictionaries, where each frame contains:
-                - image: np.ndarray [H, W, C]
-                - wrist_image: np.ndarray [H, W, C] (optional)
-                - state: np.ndarray [state_dim]
-                - actions: np.ndarray [action_dim]
-                - task: str (task instruction)
-                - intervene_flag: np.ndarray [1] of bool (optional; matches schema)
-                - Any other fields defined in the features schema
+            episode_data: List of frame dictionaries matching the configured
+                LeRobot feature schema, for example ``state``, ``next_state``,
+                ``actions``, ``rewards``, terminal flags, intervention flags,
+                optional image fields, and any other fields defined in
+                ``features``.
 
-        The frames will be automatically processed to include both the original
-        image format and the observation.images format (transposed to [C, H, W]).
+        Frames are passed through to ``LeRobotDataset.add_frame()`` unchanged.
         """
         if self.dataset is None:
             raise RuntimeError("Dataset not created. Call create() first.")

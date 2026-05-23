@@ -73,7 +73,68 @@ Save and Load
 When saving a checkpoint, cached trajectories and metadata are saved into the checkpoint path.
 Loading requires setting `load_path` to the checkpoint directory that contains both metadata
 and trajectory files.
-The trajectory data is saved in format of `trajectory_{trajectory_id}_{model_weights_uuid}_{model_update_count}.{trajectory_format}`.
+The trajectory data is saved in the format
+``trajectory_{trajectory_id}_{model_weights_id}.{pt|pkl}``.
+
+Convert Local LeRobot Datasets
+------------------------------
+
+``algorithm.demo_buffer.load_path`` expects a ``TrajectoryReplayBuffer``
+checkpoint, not a raw LeRobot parquet directory. If you already have a local
+LeRobot-format dataset root under ``data/**/*.parquet`` or a RLinf collector
+parent such as ``collected_data/`` with nested ``rank_*/id_*/data/**/*.parquet``
+roots, convert it first:
+
+.. code-block:: bash
+
+   python -m rlinf.data.lerobot_replay_buffer \
+     --dataset-path /path/to/lerobot_dataset \
+     --save-path /path/to/replay_buffer_demo
+
+The converter decodes image columns that contain arrays, PIL images, encoded
+``bytes`` payloads, or paths relative to the local LeRobot dataset root. If an
+image payload cannot be decoded, it fails fast by default. All-null optional
+image columns are treated as absent; partially-null optional image columns fail
+fast to keep camera schemas stable inside each episode. Use ``--state-only`` only
+when you explicitly want a state/action-only demo buffer and the training config
+uses a state-only actor model. Do not use ``--state-only`` for image-based
+SAC/RLPD configs such as ``cnn_policy`` or image ``flow_policy`` configs:
+
+.. code-block:: bash
+
+   python -m rlinf.data.lerobot_replay_buffer \
+     --dataset-path /path/to/collected_data \
+     --save-path /path/to/replay_buffer_demo \
+     --state-only
+
+Then replace ``load_path`` in an existing RLPD/SAC ``demo_buffer`` block:
+
+.. code-block:: yaml
+
+   algorithm:
+     demo_buffer:
+       enable_cache: True
+       cache_size: 200
+       min_buffer_size: 1
+       sample_window_size: 200
+       load_path: /path/to/replay_buffer_demo
+       load_mode: shard  # or replicate for small demo sets on multiple actor ranks
+       auto_save: False
+
+RLinf LeRobot collection writes each action frame with explicit ``next_state`` /
+``next_*`` observation fields, so terminal actions, rewards, ``terminated``,
+``truncated``, and intervention flags stay aligned with the source action. Legacy
+datasets without explicit next observations must include an observation-only
+final frame; otherwise the converter fails fast instead of silently dropping the
+last action. The converter validates ``done == terminated or truncated`` when
+split flags are present. Multi-view columns such as ``wrist_image-0`` and
+``extra_view_image-1`` are stacked into canonical replay keys.
+
+By default ``demo_buffer.load_mode: shard`` splits loaded demos across actor
+ranks. If the converted demo buffer is smaller than the actor world size, use
+``load_mode: replicate`` so every actor rank loads the full demo buffer. This is
+data plumbing for replay/demo-buffer initialization; it is not a full HIL-SERL
+reproduction or a claim about training performance.
 
 CLI Test
 --------

@@ -22,7 +22,11 @@ import torch.nn.functional as F
 from omegaconf import DictConfig
 from torch.utils.data import DataLoader
 
-from rlinf.config import SupportedModel
+from rlinf.config import (
+    SupportedModel,
+    validate_demo_buffer_load_mode,
+    validate_embodied_sac_model_type,
+)
 from rlinf.data.embodied_buffer_dataset import (
     PreloadReplayBufferDataset,
     ReplayBufferDataset,
@@ -45,6 +49,10 @@ from rlinf.utils.nested_dict_process import (
 )
 from rlinf.utils.utils import clear_memory
 from rlinf.workers.actor.fsdp_actor_worker import EmbodiedFSDPActor
+from rlinf.workers.actor.sac_demo_buffer_utils import (
+    demo_buffer_load_kwargs,
+    validate_loaded_demo_buffer,
+)
 
 
 class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
@@ -61,6 +69,7 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
         self.enable_drq = bool(getattr(self.cfg.actor, "enable_drq", False))
 
     def init_worker(self):
+        self._validate_sac_model_type()
         self.setup_model_and_optimizer(initialize_target=True)
         self.setup_sac_components()
         self.soft_update_target_model(tau=1.0)
@@ -209,9 +218,11 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
             if self.cfg.algorithm.demo_buffer.get("load_path", None) is not None:
                 self.demo_buffer.load_checkpoint(
                     self.cfg.algorithm.demo_buffer.load_path,
-                    is_distributed=True,
-                    local_rank=self._rank,
-                    world_size=self._world_size,
+                    **self._demo_buffer_load_kwargs(),
+                )
+                self._validate_loaded_demo_buffer(
+                    self.cfg.algorithm.demo_buffer.load_path,
+                    min_demo_buffer_size,
                 )
 
         if self.cfg.algorithm.replay_buffer.get("enable_preload", False):
@@ -243,6 +254,34 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
         self.target_update_type = self.cfg.algorithm.get("target_update_type", "all")
         assert self.target_update_type in ["all", "q_head_only"], (
             f"{self.target_update_type=} is not suppported!"
+        )
+
+    def _validate_sac_model_type(self) -> None:
+        validate_embodied_sac_model_type(self.cfg.actor.model, self.cfg.algorithm)
+
+    def _demo_buffer_load_kwargs(self) -> dict:
+        return demo_buffer_load_kwargs(
+            self.cfg.algorithm.demo_buffer,
+            rank=self._rank,
+            world_size=self._world_size,
+        )
+
+    def _validate_loaded_demo_buffer(
+        self,
+        load_path: str,
+        min_demo_buffer_size: int,
+    ) -> None:
+        load_mode = validate_demo_buffer_load_mode(
+            self.cfg.algorithm.get("demo_buffer", {})
+        )
+        validate_loaded_demo_buffer(
+            self.demo_buffer,
+            load_path=load_path,
+            min_demo_buffer_size=min_demo_buffer_size,
+            rank=self._rank,
+            world_size=self._world_size,
+            model_cfg=self.cfg.actor.model,
+            load_mode=load_mode,
         )
 
     def _init_target_shadow(self):

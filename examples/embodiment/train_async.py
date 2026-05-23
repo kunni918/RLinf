@@ -34,7 +34,7 @@ mp.set_start_method("spawn", force=True)
     version_base="1.1", config_path="config", config_name="maniskill_sac_mlp_async"
 )
 def main(cfg) -> None:
-    cfg = validate_cfg(cfg)
+    cfg = validate_cfg(cfg, require_embodied_sac_training_model=True)
     print(json.dumps(OmegaConf.to_container(cfg, resolve=True), indent=2))
 
     cluster = Cluster(

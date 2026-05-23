@@ -322,20 +322,24 @@ YAML 配置说明
 
 .. code-block:: bash
 
-   bash examples/embodiment/collect_data_zed_robotiq.sh
+   bash examples/embodiment/collect_data.sh realworld_collect_data_zed_robotiq
 
-脚本默认使用 ``realworld_collect_data_zed_robotiq`` 配置，
 也可以传入不同的配置名称作为参数：
 
 .. code-block:: bash
 
-   bash examples/embodiment/collect_data_zed_robotiq.sh <config_name>
+   bash examples/embodiment/collect_data.sh <config_name>
 
 采集过程中使用 SpaceMouse 遥操作机器人。脚本会在达到配置的 episode 数量后
-自动终止，数据保存在 ``logs/<时间戳>-<配置名>/collected_data/`` 目录下。
+自动终止，LeRobot 格式 episode 数据保存在
+``logs/<时间戳>/collected_data/`` 目录下。
 
-采集完成后，将数据上传到训练节点，并在训练配置中将
-``algorithm.demo_buffer.load_path`` 字段设置为数据路径。
+采集完成后，先按 :doc:`../../tutorials/components/replay_buffer` 中的方法将
+LeRobot 数据集转换为 ``TrajectoryReplayBuffer`` 格式。转换器可以直接接收
+``collected_data/`` 父目录，并会发现其下的
+``rank_*/id_*/data/**/*.parquet`` LeRobot root，同时保持不同 root 的 episode
+索引彼此隔离。然后把转换后的目录上传到训练节点，并在训练配置中将
+``algorithm.demo_buffer.load_path`` 字段设置为转换后的 replay-buffer 路径。
 
 
 集群配置注意事项

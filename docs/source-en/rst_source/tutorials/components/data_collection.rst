@@ -44,9 +44,10 @@ Key Features
   block the RL training loop.
 - The LeRobot writer is lazily initialized on the first episode write, with image
   shape, state dimension, and action dimension inferred automatically.
-- LeRobot export can store ``image`` and ``extra_view_image``. When
-  ``extra_view_images`` is a stacked ``[N, H, W, C]`` tensor, the columns are
-  fanned out by index (``extra_view_image-0``, ``extra_view_image-1``, …).
+- LeRobot export can store ``image``, ``wrist_image``, and
+  ``extra_view_image``. Stacked ``[N, H, W, C]`` wrist/extra-view tensors are
+  fanned out by index (for example ``extra_view_image-0``,
+  ``extra_view_image-1``, …).
 - Set ``only_success=True`` to filter out failed episodes and save disk space.
 
 Constructor Arguments
@@ -216,14 +217,27 @@ Parquet column schema:
      - Description
    * - ``image``
      - Main camera image (bytes + path), uint8
+   * - ``next_image``
+     - Next-step main camera image for replay-buffer conversion, uint8
+   * - ``wrist_image`` / ``wrist_image-N``
+     - Wrist camera image (bytes + path), uint8. Multi-view stacks are fanned
+       out into ``wrist_image-0``, ``wrist_image-1``, ….
+   * - ``next_wrist_image`` / ``next_wrist_image-N``
+     - Next-step wrist camera image, using the same multi-view fan-out rule
    * - ``extra_view_image`` / ``extra_view_image-N``
      - Auxiliary camera image (bytes + path), uint8. Multi-view stacks are
        fanned out into ``extra_view_image-0``, ``extra_view_image-1``, …;
        empty when no extra view is present.
+   * - ``next_extra_view_image`` / ``next_extra_view_image-N``
+     - Next-step auxiliary camera image, using the same multi-view fan-out rule
    * - ``state``
      - Robot state vector, ``float32[state_dim]``
+   * - ``next_state``
+     - Next-step robot state vector, ``float32[state_dim]``
    * - ``actions``
      - Action vector, ``float32[action_dim]``
+   * - ``rewards``
+     - Transition reward aligned with ``actions``, ``float32[1]``
    * - ``timestamp``
      - Frame timestamp in seconds, ``float``
    * - ``frame_index``
@@ -236,6 +250,8 @@ Parquet column schema:
      - Task index (references tasks.jsonl), ``int64``
    * - ``done``
      - Per-step done flag, ``bool`` (``True`` on the last step of each episode)
+   * - ``terminated`` / ``truncated``
+     - Gymnasium termination and truncation flags aligned with ``actions``
    * - ``is_success``
      - Whether the episode succeeded, ``bool``
 
@@ -249,6 +265,9 @@ Observation key lookup order (first match wins):
      - Keys checked (in priority order)
    * - Main image
      - ``main_images`` → ``image`` → ``full_image``
+   * - Wrist image
+     - ``wrist_images`` → ``wrist_image`` (``[N, H, W, C]`` stacks fan out to
+       ``wrist_image-0``, ``wrist_image-1``, …)
    * - Extra-view image
      - ``extra_view_images`` → ``extra_view_image`` (``[N, H, W, C]`` stacks
        fan out to ``extra_view_image-0``, ``extra_view_image-1``, …)
@@ -257,6 +276,10 @@ Observation key lookup order (first match wins):
 
 Images are automatically converted to uint8 (float [0, 1] arrays are multiplied
 by 255; out-of-range arrays are cast directly).
+
+All-null optional image columns are treated as absent during replay-buffer
+conversion. Partially-null optional image columns fail fast so camera schemas do
+not silently change inside one episode.
 
 Success Detection Logic
 ~~~~~~~~~~~~~~~~~~~~~~~
@@ -474,8 +497,8 @@ Best Practices
 
 - Prioritise trajectory quality. If the success rate is low, relax
   ``success_hold_steps`` or set a more tolerant ``target_ee_pose``.
-- After collection, load the buffer with ``TrajectoryReplayBuffer.load()`` to
-  verify the trajectory count before launching training.
+- After collection, load the buffer with ``TrajectoryReplayBuffer.load_checkpoint()``
+  to verify the trajectory count before launching training.
 - To append additional demonstrations, re-run the script pointing to the same
   ``demos`` directory. With ``auto_save=True``, the buffer writes incrementally
   without overwriting existing trajectories.

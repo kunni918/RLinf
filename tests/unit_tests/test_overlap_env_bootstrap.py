@@ -14,6 +14,7 @@
 
 import sys
 import unittest
+from importlib.util import find_spec
 from unittest.mock import MagicMock
 
 import torch
@@ -25,10 +26,13 @@ from rlinf.data.embodied_io_struct import EnvOutput
 # to avoid ModuleNotFoundError when gymnasium is not installed.
 # We do this here at the very top to satisfy functional requirements
 # while using # noqa for linter satisfaction if needed.
-if "gymnasium" not in sys.modules:
+if "gymnasium" not in sys.modules and find_spec("gymnasium") is None:
     sys.modules["gymnasium"] = MagicMock()
 
-if "rlinf.envs.wrappers" not in sys.modules:
+if (
+    "rlinf.envs.wrappers" not in sys.modules
+    and find_spec("rlinf.envs.wrappers") is None
+):
     sys.modules["rlinf.envs.wrappers"] = MagicMock()
 
 from rlinf.workers.env.env_worker import EnvWorker  # noqa: E402

@@ -67,7 +67,7 @@ This ensures the BN statistics are computed over a mixture of current and replay
 4. Configuration
 --------------------
 
-CrossQ shares a nearly identical configuration with SAC. A single parameter, `q_head_type`, can be used to toggle between the CrossQ and standard SAC architectures.
+CrossQ shares a nearly identical configuration with SAC. Set `q_head_type` to `crossq` in both `algorithm` and `actor.model`; the two values must match. CrossQ is currently supported for MLP/CNN SAC policies.
 
 .. code-block:: yaml
 
@@ -81,7 +81,7 @@ CrossQ shares a nearly identical configuration with SAC. A single parameter, `q_
       loss_type: embodied_sac
       loss_agg_func: "token-mean"
       q_head_type: "crossq" # ["crossq", "default"]. Choose CrossQ or standard SAC Q-head.
-      
+
       bootstrap_type: standard # [standard, always]. Bootstrap Q-values according to terminations and truncations. "standard" only bootstraps when truncations, while "always" bootstraps when truncations or terminations.
       gamma: 0.8 # Discount factor.
       tau: 0.01  # Soft update coefficient for target networks
@@ -101,3 +101,9 @@ CrossQ shares a nearly identical configuration with SAC. A single parameter, `q_
          cache_size: 6000  # number of trajectories cached in memory
          sample_window_size: 6000  # number of latest trajectories to sample from for replay buffer
          min_buffer_size: 2  # Minimum buffer size before training starts (in number of trajectories)
+
+   actor:
+      model:
+         model_type: "mlp_policy" # or "cnn_policy"
+         add_q_head: true
+         q_head_type: "crossq" # Must match algorithm.q_head_type.

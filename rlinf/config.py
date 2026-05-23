@@ -126,6 +126,105 @@ EMBODIED_MODEL = set(
 )
 
 
+SAC_SUPPORTED_MODEL_TYPES = {
+    SupportedModel.MLP_POLICY,
+    SupportedModel.CNN_POLICY,
+    SupportedModel.FLOW_POLICY,
+    SupportedModel.OPENPI,
+}
+
+
+def is_embodied_sac_algorithm(algorithm_cfg: DictConfig) -> bool:
+    return (
+        algorithm_cfg.get("loss_type") == "embodied_sac"
+        or algorithm_cfg.get("adv_type") == "embodied_sac"
+    )
+
+
+def validate_demo_buffer_load_mode(demo_cfg: DictConfig) -> str:
+    load_mode = str(demo_cfg.get("load_mode", "shard"))
+    if "load_distributed" in demo_cfg:
+        legacy_mode = "shard" if demo_cfg.load_distributed else "replicate"
+        if "load_mode" in demo_cfg and load_mode != legacy_mode:
+            raise ValueError(
+                "algorithm.demo_buffer.load_mode conflicts with legacy "
+                "algorithm.demo_buffer.load_distributed."
+            )
+        load_mode = legacy_mode
+    if load_mode not in ("shard", "replicate"):
+        raise ValueError(
+            f"Unsupported algorithm.demo_buffer.load_mode={load_mode!r}; "
+            "expected 'shard' or 'replicate'."
+        )
+    return load_mode
+
+
+def validate_embodied_sac_model_type(
+    model_cfg: DictConfig, algorithm_cfg: DictConfig | None = None
+) -> None:
+    model_type = SupportedModel(model_cfg.model_type)
+    if model_type not in SAC_SUPPORTED_MODEL_TYPES:
+        supported_models = sorted(model.value for model in SAC_SUPPORTED_MODEL_TYPES)
+        raise ValueError(
+            f"actor.model.model_type={model_type.value!r} does not support SAC "
+            f"training. Supported SAC model types: {supported_models}."
+        )
+    valid_q_head_types = {"default", "crossq"}
+    model_q_head_type = str(model_cfg.get("q_head_type", "default"))
+    algorithm_q_head_type = (
+        str(algorithm_cfg.get("q_head_type", "default"))
+        if algorithm_cfg is not None
+        else model_q_head_type
+    )
+    for owner, q_head_type in (
+        ("actor.model.q_head_type", model_q_head_type),
+        ("algorithm.q_head_type", algorithm_q_head_type),
+    ):
+        if q_head_type not in valid_q_head_types:
+            raise ValueError(
+                f"Unsupported {owner}={q_head_type!r}; expected one of "
+                f"{sorted(valid_q_head_types)}."
+            )
+    if algorithm_q_head_type != model_q_head_type:
+        raise ValueError(
+            "Embodied SAC CrossQ q_head_type must be configured consistently: "
+            f"algorithm.q_head_type={algorithm_q_head_type!r}, "
+            f"actor.model.q_head_type={model_q_head_type!r}."
+        )
+    if model_q_head_type == "crossq" and model_type not in (
+        SupportedModel.MLP_POLICY,
+        SupportedModel.CNN_POLICY,
+    ):
+        raise ValueError(
+            "Embodied SAC CrossQ requires actor.model.model_type to be "
+            "'mlp_policy' or 'cnn_policy'."
+        )
+    if model_type == SupportedModel.OPENPI and not model_cfg.get("openpi", {}).get(
+        "use_dsrl", False
+    ):
+        raise ValueError(
+            "OpenPI SAC training requires actor.model.openpi.use_dsrl: true."
+        )
+    if model_type == SupportedModel.OPENPI:
+        return
+
+    if not bool(model_cfg.get("add_q_head", False)):
+        raise ValueError(
+            "Embodied SAC training requires actor.model.add_q_head: true for "
+            f"actor.model.model_type={model_type.value!r}."
+        )
+
+
+def validate_embodied_sac_cfg(
+    cfg: DictConfig, *, require_training_model: bool = False
+) -> None:
+    if require_training_model or not bool(cfg.runner.get("only_eval", False)):
+        validate_embodied_sac_model_type(cfg.actor.model, cfg.algorithm)
+    demo_cfg = cfg.algorithm.get("demo_buffer", None)
+    if demo_cfg is not None:
+        validate_demo_buffer_load_mode(demo_cfg)
+
+
 SUPPORTED_ROLLOUT_BACKENDS = ["sglang", "vllm"]
 SUPPORTED_TASK_TYPE = [
     "embodied",
@@ -805,12 +904,16 @@ def validate_megatron_cfg(cfg: DictConfig) -> DictConfig:
     return cfg
 
 
-def validate_embodied_cfg(cfg):
+def validate_embodied_cfg(cfg, *, require_embodied_sac_training_model: bool = False):
     model_type = SupportedModel(cfg.actor.model.model_type)
     assert model_type in EMBODIED_MODEL, (
         f"Model type: '{cfg.actor.model.model_type}' is not an embodied model. "
         f"Supported embodied models: {sorted([x.value for x in EMBODIED_MODEL])}."
     )
+    if is_embodied_sac_algorithm(cfg.algorithm):
+        validate_embodied_sac_cfg(
+            cfg, require_training_model=require_embodied_sac_training_model
+        )
 
     # NOTE: Currently we only support actor_critic as PPO algorithm loss, and only support value_head as critic model.
     # This will be updated in the future to support more algorithms and critic models.
@@ -1190,7 +1293,9 @@ def validate_coding_online_rl_cfg(cfg: DictConfig) -> DictConfig:
     return cfg
 
 
-def validate_cfg(cfg: DictConfig) -> DictConfig:
+def validate_cfg(
+    cfg: DictConfig, *, require_embodied_sac_training_model: bool = False
+) -> DictConfig:
     OmegaConf.set_struct(cfg, True)
 
     with open_dict(cfg):
@@ -1211,6 +1316,14 @@ def validate_cfg(cfg: DictConfig) -> DictConfig:
                 )
             )
 
+    assert cfg.runner.task_type in SUPPORTED_TASK_TYPE, (
+        f"task_type must be one of {SUPPORTED_TASK_TYPE}"
+    )
+    if cfg.runner.task_type == "embodied" and is_embodied_sac_algorithm(cfg.algorithm):
+        validate_embodied_sac_cfg(
+            cfg, require_training_model=require_embodied_sac_training_model
+        )
+
     # Init cluster
     Cluster(
         cluster_cfg=cfg.cluster,
@@ -1218,11 +1331,11 @@ def validate_cfg(cfg: DictConfig) -> DictConfig:
         nsight_output_dir=cfg.runner.nsight_output_path,
     )
 
-    assert cfg.runner.task_type in SUPPORTED_TASK_TYPE, (
-        f"task_type must be one of {SUPPORTED_TASK_TYPE}"
-    )
     if cfg.runner.task_type == "embodied":
-        cfg = validate_embodied_cfg(cfg)
+        cfg = validate_embodied_cfg(
+            cfg,
+            require_embodied_sac_training_model=require_embodied_sac_training_model,
+        )
     elif cfg.runner.task_type == "reasoning":
         cfg = validate_reasoning_cfg(cfg)
     elif cfg.runner.task_type == "coding_online_rl":

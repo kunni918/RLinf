@@ -335,22 +335,24 @@ Key data-collection settings in the same file:
 
 .. code-block:: bash
 
-   bash examples/embodiment/collect_data_zed_robotiq.sh
+   bash examples/embodiment/collect_data.sh realworld_collect_data_zed_robotiq
 
-The script defaults to the ``realworld_collect_data_zed_robotiq`` config.
 You can pass a different config name as an argument:
 
 .. code-block:: bash
 
-   bash examples/embodiment/collect_data_zed_robotiq.sh <config_name>
+   bash examples/embodiment/collect_data.sh <config_name>
 
 During collection, use the SpaceMouse to teleoperate the robot.  The script
-will terminate after the configured number of episodes and save the data
-under ``logs/<timestamp>-<config_name>/collected_data/``.
+will terminate after the configured number of episodes and save LeRobot-format
+episode data under ``logs/<timestamp>/collected_data/``.
 
-After collection, upload the data to the training node and set the
-``algorithm.demo_buffer.load_path`` field in your training config to the
-data path.
+After collection, convert the LeRobot dataset to ``TrajectoryReplayBuffer``
+format as described in :doc:`../../tutorials/components/replay_buffer`. You may
+pass the parent ``collected_data/`` directory to the converter; it will discover
+the nested ``rank_*/id_*/data/**/*.parquet`` LeRobot roots and keep their episode
+indices separate. Upload the converted directory to the training node, and set
+``algorithm.demo_buffer.load_path`` to that converted replay-buffer path.
 
 
 Cluster Setup Notes

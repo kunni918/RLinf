@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import asyncio
+import copy
 import gc
 from collections import defaultdict
 from typing import Any, Literal
@@ -419,6 +420,7 @@ class EnvWorker(Worker):
         final_obs = (
             self._build_chunk_final_obs(obs_list, infos_list)
             if self.use_external_reward_model
+            or (self.cfg.env.train.auto_reset and chunk_dones.any())
             else (
                 infos["final_observation"]
                 if isinstance(infos, dict) and "final_observation" in infos
@@ -437,17 +439,24 @@ class EnvWorker(Worker):
                     for key in infos["episode"]:
                         env_info[key] = infos["episode"][key].cpu()
         elif chunk_dones.any():
-            if "final_info" in infos:
-                final_info = infos["final_info"]
-                for key in final_info["episode"]:
-                    env_info[key] = final_info["episode"][key][chunk_dones[:, -1]].cpu()
+            self._collect_chunk_final_episode_info(env_info, infos_list, chunk_dones)
 
-        intervene_actions = (
-            infos["intervene_action"] if "intervene_action" in infos else None
-        )
-        intervene_flags = infos["intervene_flag"] if "intervene_flag" in infos else None
-        if self.cfg.env.train.auto_reset and chunk_dones.any():
-            if "intervene_action" in infos["final_info"]:
+        intervene_actions = None
+        intervene_flags = None
+        if isinstance(infos, dict):
+            intervene_actions = infos.get(
+                "chunk_intervene_action", infos.get("intervene_action")
+            )
+            intervene_flags = infos.get(
+                "chunk_intervene_flag", infos.get("intervene_flag")
+            )
+            if (
+                intervene_actions is None
+                and self.cfg.env.train.auto_reset
+                and chunk_dones.any()
+                and "final_info" in infos
+                and "intervene_action" in infos["final_info"]
+            ):
                 intervene_actions = infos["final_info"]["intervene_action"]
                 intervene_flags = infos["final_info"]["intervene_flag"]
 
@@ -455,7 +464,9 @@ class EnvWorker(Worker):
             obs=extracted_obs,
             final_obs=final_obs,
             rewards=chunk_rewards,
-            env_infos=infos if isinstance(infos, dict) else None,
+            env_infos=self._build_chunk_reward_env_infos(
+                infos, infos_list, chunk_dones
+            ),
             dones=chunk_dones,
             terminations=chunk_terminations,
             truncations=chunk_truncations,
@@ -492,6 +503,7 @@ class EnvWorker(Worker):
         final_obs = (
             self._build_chunk_final_obs(obs_list, infos_list)
             if self.use_external_reward_model
+            or (self.cfg.env.eval.auto_reset and chunk_dones.any())
             else (
                 infos["final_observation"]
                 if isinstance(infos, dict) and "final_observation" in infos
@@ -499,20 +511,21 @@ class EnvWorker(Worker):
             )
         )
 
-        current_dones = chunk_dones[:, -1]  # [num_envs] bool
+        current_dones = chunk_dones.any(dim=1)  # [num_envs] bool
         if self.cfg.env.eval.auto_reset:
-            newly_done = current_dones
+            newly_done_steps = chunk_dones
         else:
             prev = self.eval_prev_done[stage_id].to(current_dones.device)
             newly_done = current_dones & ~prev
             self.eval_prev_done[stage_id] = prev | current_dones
+            newly_done_steps = chunk_dones & newly_done[:, None]
 
-        if newly_done.any():
-            if "final_info" in infos:
-                final_info = infos["final_info"]
-                for key in final_info["episode"]:
-                    env_info[key] = final_info["episode"][key][newly_done].cpu()
-            elif "episode" in infos:
+        if newly_done_steps.any():
+            self._collect_chunk_final_episode_info(
+                env_info, infos_list, newly_done_steps
+            )
+            if not env_info and isinstance(infos, dict) and "episode" in infos:
+                newly_done = newly_done_steps.any(dim=1)
                 for key in infos["episode"]:
                     env_info[key] = infos["episode"][key][newly_done].cpu()
 
@@ -521,6 +534,241 @@ class EnvWorker(Worker):
             final_obs=final_obs,
         )
         return env_output, env_info
+
+    def _collect_chunk_final_episode_info(self, env_info, infos_list, done_steps):
+        if not isinstance(infos_list, (list, tuple)):
+            return
+
+        for step_idx, step_infos in enumerate(infos_list):
+            if not isinstance(step_infos, dict) or "final_info" not in step_infos:
+                continue
+            final_info = step_infos["final_info"]
+            if not isinstance(final_info, dict) or "episode" not in final_info:
+                continue
+            done_mask = done_steps[:, step_idx]
+            if not done_mask.any():
+                continue
+            for key, value in final_info["episode"].items():
+                selected_value = value[done_mask].cpu()
+                if key in env_info:
+                    env_info[key] = torch.cat([env_info[key], selected_value], dim=0)
+                else:
+                    env_info[key] = selected_value
+
+    def _build_chunk_reward_env_infos(self, last_infos, infos_list, done_steps):
+        if not isinstance(last_infos, dict):
+            return None
+        env_infos = dict(last_infos)
+        if not isinstance(infos_list, (list, tuple)) or done_steps is None:
+            return env_infos
+
+        env_infos.pop("final_info", None)
+        final_info = None
+        for step_idx, step_infos in enumerate(infos_list):
+            if not isinstance(step_infos, dict) or "final_info" not in step_infos:
+                continue
+            done_mask = done_steps[:, step_idx]
+            if done_mask.any():
+                final_info = self._merge_nested_batch_values_by_mask(
+                    final_info, step_infos["final_info"], done_mask
+                )
+        if final_info is not None:
+            env_infos["final_info"] = final_info
+        return env_infos
+
+    @staticmethod
+    def _merge_nested_batch_values_by_mask(base, update, mask):
+        """Merge per-env nested values from update where mask is true."""
+        if base is None:
+            return EnvWorker._empty_masked_nested_batch_value(update, mask)
+        if isinstance(base, dict) and isinstance(update, dict):
+            merged = {key: copy.deepcopy(value) for key, value in base.items()}
+            for key, update_value in update.items():
+                if key in merged:
+                    merged[key] = EnvWorker._merge_nested_batch_values_by_mask(
+                        merged[key], update_value, mask
+                    )
+                else:
+                    merged[key] = EnvWorker._empty_masked_nested_batch_value(
+                        update_value, mask
+                    )
+            return merged
+        if isinstance(base, torch.Tensor) and isinstance(update, torch.Tensor):
+            if base.shape[:1] != update.shape[:1] or base.shape[:1] != mask.shape[:1]:
+                raise ValueError(
+                    "Cannot merge final_info tensors with mismatched batch shapes: "
+                    f"base_shape={tuple(base.shape)}, "
+                    f"update_shape={tuple(update.shape)}, "
+                    f"mask_shape={tuple(mask.shape)}."
+                )
+            merged = base.clone()
+            base_mask = mask.to(device=merged.device, dtype=torch.bool)
+            update_mask = mask.to(device=update.device, dtype=torch.bool)
+            merged[base_mask] = update[update_mask].to(
+                device=merged.device, dtype=merged.dtype
+            )
+            return merged
+        if isinstance(base, np.ndarray) and isinstance(update, np.ndarray):
+            if base.shape[:1] != update.shape[:1] or base.shape[:1] != mask.shape[:1]:
+                raise ValueError(
+                    "Cannot merge final_info arrays with mismatched batch shapes: "
+                    f"base_shape={base.shape}, update_shape={update.shape}, "
+                    f"mask_shape={tuple(mask.shape)}."
+                )
+            merged = base.copy()
+            np_mask = mask.detach().cpu().numpy().astype(bool)
+            merged[np_mask] = update[np_mask]
+            return merged
+        return copy.deepcopy(update) if bool(mask.any()) else copy.deepcopy(base)
+
+    @staticmethod
+    def _empty_masked_nested_batch_value(update, mask):
+        if isinstance(update, dict):
+            return {
+                key: EnvWorker._empty_masked_nested_batch_value(value, mask)
+                for key, value in update.items()
+            }
+        if isinstance(update, torch.Tensor):
+            masked = torch.zeros_like(update)
+            if update.shape[:1] != mask.shape[:1]:
+                raise ValueError(
+                    "Cannot build masked final_info tensor with mismatched shape: "
+                    f"update_shape={tuple(update.shape)}, "
+                    f"mask_shape={tuple(mask.shape)}."
+                )
+            update_mask = mask.to(device=update.device, dtype=torch.bool)
+            masked[update_mask] = update[update_mask]
+            return masked
+        if isinstance(update, np.ndarray):
+            masked = np.zeros_like(update)
+            if update.shape[:1] != mask.shape[:1]:
+                raise ValueError(
+                    "Cannot build masked final_info array with mismatched shape: "
+                    f"update_shape={update.shape}, mask_shape={tuple(mask.shape)}."
+                )
+            np_mask = mask.detach().cpu().numpy().astype(bool)
+            masked[np_mask] = update[np_mask]
+            return masked
+        return copy.deepcopy(update) if bool(mask.any()) else None
+
+    @staticmethod
+    def _mask_chunk_tensor(
+        value: torch.Tensor | None,
+        valid_steps: torch.Tensor,
+        *,
+        field_name: str,
+    ) -> torch.Tensor | None:
+        if value is None:
+            return None
+        if not isinstance(value, torch.Tensor):
+            return value
+        if valid_steps.ndim != 2:
+            raise ValueError(
+                f"chunk_valid_step must be rank-2 [B, chunk_steps], got "
+                f"shape={tuple(valid_steps.shape)}."
+            )
+        batch_size, chunk_steps = valid_steps.shape
+        if value.shape[:1] != (batch_size,):
+            return value
+        mask = valid_steps.to(device=value.device, dtype=torch.bool)
+        if value.ndim >= 3 and value.shape[1] == chunk_steps:
+            view_shape = (batch_size, chunk_steps) + (1,) * (value.ndim - 2)
+            return value.masked_fill(~mask.view(view_shape), 0)
+        if value.ndim == 2 and value.shape[1] % chunk_steps == 0:
+            action_dim = value.shape[1] // chunk_steps
+            reshaped = value.reshape(batch_size, chunk_steps, action_dim)
+            return reshaped.masked_fill(~mask.unsqueeze(-1), 0).reshape_as(value)
+        raise ValueError(
+            f"Cannot align {field_name} shape={tuple(value.shape)} with "
+            f"chunk_valid_step shape={tuple(valid_steps.shape)}."
+        )
+
+    def _mask_invalid_chunk_actions(
+        self, rollout_result: RolloutResult, env_output: EnvOutput
+    ) -> RolloutResult:
+        valid_steps = self._get_chunk_valid_steps(env_output)
+        if valid_steps is None:
+            return rollout_result
+        rollout_result.actions = self._mask_chunk_tensor(
+            rollout_result.actions, valid_steps, field_name="actions"
+        )
+        if (
+            rollout_result.save_flags is not None
+            and rollout_result.save_flags.shape == valid_steps.shape
+        ):
+            rollout_result.save_flags = rollout_result.save_flags & valid_steps.to(
+                device=rollout_result.save_flags.device
+            )
+        if rollout_result.forward_inputs:
+            forward_inputs = dict(rollout_result.forward_inputs)
+            for key in ("action", "model_action"):
+                if key in forward_inputs:
+                    forward_inputs[key] = self._mask_chunk_tensor(
+                        forward_inputs[key],
+                        valid_steps,
+                        field_name=f"forward_inputs.{key}",
+                    )
+            rollout_result.forward_inputs = forward_inputs
+        return rollout_result
+
+    @staticmethod
+    def _get_chunk_valid_steps(env_output: EnvOutput) -> torch.Tensor | None:
+        if not isinstance(env_output.env_infos, dict):
+            return None
+        valid_steps = env_output.env_infos.get("chunk_valid_step")
+        if valid_steps is None:
+            return None
+        return torch.as_tensor(valid_steps, dtype=torch.bool)
+
+    def _mask_last_invalid_chunk_actions(
+        self, rollout_result: EmbodiedRolloutResult, env_output: EnvOutput
+    ) -> None:
+        valid_steps = self._get_chunk_valid_steps(env_output)
+        if valid_steps is None or not rollout_result.actions:
+            return
+        rollout_result.actions[-1] = self._mask_chunk_tensor(
+            rollout_result.actions[-1], valid_steps, field_name="actions"
+        )
+        if rollout_result.intervene_flags:
+            rollout_result.intervene_flags[-1] = self._mask_chunk_tensor(
+                rollout_result.intervene_flags[-1],
+                valid_steps,
+                field_name="intervene_flags",
+            )
+        if rollout_result.forward_inputs:
+            last_forward_inputs = dict(rollout_result.forward_inputs[-1])
+            for key in ("action", "model_action"):
+                if key in last_forward_inputs:
+                    last_forward_inputs[key] = self._mask_chunk_tensor(
+                        last_forward_inputs[key],
+                        valid_steps,
+                        field_name=f"forward_inputs.{key}",
+                    )
+            rollout_result.forward_inputs[-1] = last_forward_inputs
+
+    def _update_last_actions_from_env_output(
+        self, rollout_result: EmbodiedRolloutResult, env_output: EnvOutput
+    ) -> None:
+        if (
+            env_output.intervene_actions is not None
+            and env_output.intervene_flags is not None
+        ):
+            intervene_actions = env_output.intervene_actions
+            intervene_flags = env_output.intervene_flags
+            valid_steps = self._get_chunk_valid_steps(env_output)
+            if valid_steps is not None:
+                intervene_actions = self._mask_chunk_tensor(
+                    intervene_actions,
+                    valid_steps,
+                    field_name="intervene_actions",
+                )
+                intervene_flags = self._mask_chunk_tensor(
+                    intervene_flags,
+                    valid_steps,
+                    field_name="intervene_flags",
+                )
+            rollout_result.update_last_actions(intervene_actions, intervene_flags)
+        self._mask_last_invalid_chunk_actions(rollout_result, env_output)
 
     def _build_chunk_final_obs(self, obs_list, infos_list):
         """Build per-env terminal observations for a whole chunk.
@@ -679,7 +927,15 @@ class EnvWorker(Worker):
             return None
 
         if reward_model_output is not None:
-            reward_model_output = reward_model_output.to(rewards.dtype)
+            reward_model_output = reward_model_output.to(
+                device=rewards.device, dtype=rewards.dtype
+            )
+            if reward_model_output.shape != rewards.shape:
+                raise ValueError(
+                    "reward_model_output shape must match env rewards shape: "
+                    f"reward_model_output_shape={tuple(reward_model_output.shape)}, "
+                    f"rewards_shape={tuple(rewards.shape)}."
+                )
             rewards = (
                 self.env_reward_weight * rewards
                 + self.reward_weight * reward_model_output
@@ -695,18 +951,46 @@ class EnvWorker(Worker):
 
         bootstrap_type = self.cfg.algorithm.get("bootstrap_type", "standard")
         if bootstrap_type == "standard":
-            last_step_truncations = env_output.truncations[:, -1]
+            bootstrap_steps = env_output.truncations
         else:
-            last_step_truncations = env_output.dones[:, -1]
+            bootstrap_steps = env_output.dones
 
-        if not last_step_truncations.any():
+        if bootstrap_steps is None:
             return adjusted_rewards
 
-        final_values = torch.zeros_like(adjusted_rewards[:, -1], dtype=torch.float32)
-        final_values[last_step_truncations] = (
-            bootstrap_values[last_step_truncations].reshape(-1).to(torch.float32)
+        bootstrap_steps = bootstrap_steps.to(
+            device=adjusted_rewards.device, dtype=torch.bool
         )
-        adjusted_rewards[:, -1] += self.cfg.algorithm.gamma * final_values
+        if bootstrap_steps.dim() != adjusted_rewards.dim():
+            raise ValueError(
+                "bootstrap mask rank must match rewards rank: "
+                f"bootstrap_steps_shape={tuple(bootstrap_steps.shape)}, "
+                f"rewards_shape={tuple(adjusted_rewards.shape)}."
+            )
+        if not bootstrap_steps.any():
+            return adjusted_rewards
+        bootstrap_values = bootstrap_values.reshape(-1).to(
+            device=adjusted_rewards.device, dtype=torch.float32
+        )
+        if bootstrap_steps.dim() == 1:
+            adjusted_rewards[bootstrap_steps] += (
+                self.cfg.algorithm.gamma * bootstrap_values[bootstrap_steps]
+            ).to(adjusted_rewards.dtype)
+            return adjusted_rewards
+
+        if bootstrap_steps.dim() != 2:
+            raise ValueError(
+                "bootstrap mask rank must be 1 or 2: "
+                f"bootstrap_steps_shape={tuple(bootstrap_steps.shape)}."
+            )
+        has_bootstrap = bootstrap_steps.any(dim=1)
+        first_bootstrap_step = bootstrap_steps.to(torch.int64).argmax(dim=1)
+        rows = torch.arange(adjusted_rewards.shape[0], device=adjusted_rewards.device)
+        rows = rows[has_bootstrap]
+        cols = first_bootstrap_step[has_bootstrap].to(device=adjusted_rewards.device)
+        adjusted_rewards[rows, cols] += (
+            self.cfg.algorithm.gamma * bootstrap_values[has_bootstrap]
+        ).to(adjusted_rewards.dtype)
         return adjusted_rewards
 
     def finish_rollout(self, mode="train"):
@@ -817,8 +1101,9 @@ class EnvWorker(Worker):
             )
 
         dones = env_output.dones
-        if dones is not None and getattr(dones, "ndim", 0) > 1:
-            dones = dones[:, -1]
+        if dones is not None:
+            if getattr(dones, "ndim", 0) > 1:
+                dones = dones.any(dim=1)
             reward_input.update({"dones": dones})
 
         if self.reward_mode == "history_buffer":
@@ -1044,11 +1329,9 @@ class EnvWorker(Worker):
 
                     env_output = env_outputs[stage_id]
                     curr_obs = env_output.obs
-                    if env_output.intervene_actions is not None:
-                        self.rollout_results[stage_id].update_last_actions(
-                            env_output.intervene_actions,
-                            env_output.intervene_flags,
-                        )
+                    self._update_last_actions_from_env_output(
+                        self.rollout_results[stage_id], env_output
+                    )
 
                     reward_model_output = None
                     if reward_channel is not None and chunk_step_idx != 0:
@@ -1103,6 +1386,9 @@ class EnvWorker(Worker):
                     env_output, env_info = self.env_interact_step(
                         rollout_result.actions, stage_id
                     )
+                    self._mask_last_invalid_chunk_actions(
+                        self.rollout_results[stage_id], env_output
+                    )
                     env_batch = env_output.to_dict()
                     self.send_env_batch(
                         rollout_channel,
@@ -1126,11 +1412,9 @@ class EnvWorker(Worker):
 
             for stage_id in range(self.stage_num):
                 env_output = env_outputs[stage_id]
-                if env_output.intervene_actions is not None:
-                    self.rollout_results[stage_id].update_last_actions(
-                        env_output.intervene_actions,
-                        env_output.intervene_flags,
-                    )
+                self._update_last_actions_from_env_output(
+                    self.rollout_results[stage_id], env_output
+                )
 
                 reward_model_output = None
                 if reward_channel is not None:

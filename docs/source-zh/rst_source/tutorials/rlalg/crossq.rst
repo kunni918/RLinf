@@ -70,7 +70,7 @@ CrossQ 引入了三个关键的设计：
 4. 配置
 ----------
 
-CrossQ与SAC使用几乎相同的配置。参数 `q_head_type` 可用于在CrossQ和标准SAC架构之间切换。
+CrossQ 与 SAC 使用几乎相同的配置。需要同时在 `algorithm` 和 `actor.model` 中把 `q_head_type` 设为 `crossq`，两处取值必须一致。当前 CrossQ 仅支持 MLP/CNN SAC policy。
 
 .. code-block:: yaml
 
@@ -102,3 +102,9 @@ CrossQ与SAC使用几乎相同的配置。参数 `q_head_type` 可用于在Cross
          cache_size: 6000 # 内存缓存的轨迹数量
          sample_window_size: 6000 # 滑动采样窗口大小
          min_buffer_size: 2  # 开始更新策略时缓冲区数据量最小值（以Trajectory为单位）
+
+   actor:
+      model:
+         model_type: "mlp_policy" # 或 "cnn_policy"
+         add_q_head: true
+         q_head_type: "crossq" # 必须与 algorithm.q_head_type 一致

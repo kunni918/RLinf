@@ -384,6 +384,7 @@ class Trajectory:
     terminations: torch.Tensor = None
     truncations: torch.Tensor = None
     dones: torch.Tensor = None
+    loss_mask: torch.Tensor = None
     prev_logprobs: torch.Tensor = None
     prev_values: torch.Tensor = None
     versions: torch.Tensor = None
@@ -466,6 +467,7 @@ class Trajectory:
 
             actions = apply_mask(self.actions, i)
             rewards = apply_mask(self.rewards, i)
+            loss_mask = apply_mask(self.loss_mask, i)
             prev_logprobs = apply_mask(self.prev_logprobs, i)
             prev_values = apply_mask(self.prev_values, i)
             intervene_flags = apply_mask(self.intervene_flags, i)
@@ -490,6 +492,7 @@ class Trajectory:
                     actions=actions,
                     intervene_flags=intervene_flags,
                     rewards=rewards,
+                    loss_mask=loss_mask,
                     terminations=terminations,
                     truncations=truncations,
                     dones=dones,
@@ -527,6 +530,7 @@ class EmbodiedRolloutResult:
     dones: list[torch.Tensor] = field(
         default_factory=list
     )  # trajectory_length + rollout_epoch
+    loss_mask: list[torch.Tensor] = field(default_factory=list)  # trajectory_length
     prev_logprobs: list[torch.Tensor] = field(default_factory=list)  # trajectory_length
     prev_values: list[torch.Tensor] = field(
         default_factory=list
@@ -576,6 +580,27 @@ class EmbodiedRolloutResult:
             last_action.reshape(bsz, num_action_chunks, -1)
         )
         self.intervene_flags[-1] = expanded_flags.reshape(bsz, -1).to(torch.bool)
+
+    def mark_last_step_with_loss_mask(self, loss_mask: torch.Tensor):
+        if not self.actions:
+            return
+
+        if loss_mask.dim() == 1:
+            loss_mask = loss_mask[:, None]
+        assert loss_mask.dim() == 2, f"Expected 2D tensor, got {loss_mask.shape=}"
+
+        bool_mask = loss_mask.to(torch.bool).cpu().contiguous()
+        if len(self.loss_mask) == len(self.actions):
+            # Called again on the same step (e.g. from the rollout loop and from
+            # _update_last_actions_from_env_output on the next iteration).
+            self.loss_mask[-1] = bool_mask
+        else:
+            assert len(self.loss_mask) == len(self.actions) - 1, (
+                f"loss_mask length {len(self.loss_mask)} is out of sync with "
+                f"actions length {len(self.actions)}; producers must mark "
+                "loss_mask consistently on every step."
+            )
+            self.loss_mask.append(bool_mask)
 
     def update_last_actions(
         self, intervene_actions: torch.Tensor, intervene_flags: torch.Tensor
@@ -636,6 +661,7 @@ class EmbodiedRolloutResult:
         self.terminations.clear()
         self.truncations.clear()
         self.dones.clear()
+        self.loss_mask.clear()
         self.prev_logprobs.clear()
         self.prev_values.clear()
         self.versions.clear()
@@ -666,6 +692,8 @@ class EmbodiedRolloutResult:
             )
         if len(self.dones) > 0:
             trajectory.dones = torch.stack(self.dones, dim=0).cpu().contiguous()
+        if len(self.loss_mask) > 0:
+            trajectory.loss_mask = torch.stack(self.loss_mask, dim=0).cpu().contiguous()
         if len(self.prev_logprobs) > 0:
             trajectory.prev_logprobs = (
                 torch.stack(self.prev_logprobs, dim=0).cpu().contiguous()
@@ -762,6 +790,22 @@ def convert_trajectories_to_batch(
         return {}
 
     batch: dict[str, torch.Tensor] = {}
+
+    def _validate_uniform_keys(field_name: str) -> None:
+        expected_keys = set(getattr(trajectories[0], field_name).keys())
+        for index, trajectory in enumerate(trajectories[1:], start=1):
+            keys = set(getattr(trajectory, field_name).keys())
+            if keys != expected_keys:
+                missing = sorted(expected_keys - keys)
+                extra = sorted(keys - expected_keys)
+                raise ValueError(
+                    f"Trajectory {field_name} schema must be uniform across "
+                    f"the batch; trajectory_id={index}, missing_keys={missing}, "
+                    f"extra_keys={extra}."
+                )
+
+    for nested_field_name in ("curr_obs", "next_obs", "forward_inputs"):
+        _validate_uniform_keys(nested_field_name)
 
     # -------- obs / forward_inputs: dict[str, Tensor] --------
     if trajectories[0].curr_obs:

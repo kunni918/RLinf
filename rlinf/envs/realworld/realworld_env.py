@@ -27,6 +27,7 @@ from filelock import FileLock
 from omegaconf import OmegaConf
 
 from rlinf.envs.realworld.venv import NoAutoResetSyncVectorEnv
+from rlinf.envs.realworld_chunk_utils import run_realworld_chunk_step
 from rlinf.envs.utils import to_tensor
 from rlinf.scheduler import WorkerInfo
 
@@ -287,74 +288,7 @@ class RealWorldEnv(gym.Env):
         )
 
     def chunk_step(self, chunk_actions):
-        # chunk_actions: [num_envs, chunk_step, action_dim]
-        chunk_size = chunk_actions.shape[1]
-        obs_list = []
-        infos_list = []
-
-        chunk_rewards = []
-
-        raw_chunk_terminations = []
-        raw_chunk_truncations = []
-
-        raw_chunk_intervene_actions = []
-        raw_chunk_intervene_flag = []
-        for i in range(chunk_size):
-            actions = chunk_actions[:, i]
-            extracted_obs, step_reward, terminations, truncations, infos = self.step(
-                actions, auto_reset=False
-            )
-            obs_list.append(extracted_obs)
-            infos_list.append(infos)
-            if "intervene_action" in infos:
-                raw_chunk_intervene_actions.append(infos["intervene_action"])
-                raw_chunk_intervene_flag.append(infos["intervene_flag"])
-
-            chunk_rewards.append(step_reward)
-            raw_chunk_terminations.append(terminations)
-            raw_chunk_truncations.append(truncations)
-
-        chunk_rewards = torch.stack(chunk_rewards, dim=1)  # [num_envs, chunk_steps]
-        raw_chunk_terminations = torch.stack(
-            raw_chunk_terminations, dim=1
-        )  # [num_envs, chunk_steps]
-        raw_chunk_truncations = torch.stack(
-            raw_chunk_truncations, dim=1
-        )  # [num_envs, chunk_steps]
-
-        past_terminations = raw_chunk_terminations.any(dim=1)
-        past_truncations = raw_chunk_truncations.any(dim=1)
-        past_dones = torch.logical_or(past_terminations, past_truncations)
-
-        infos_last = infos_list[-1] if infos_list else {}
-        if raw_chunk_intervene_actions:
-            infos_last["intervene_action"] = torch.stack(
-                raw_chunk_intervene_actions, dim=1
-            ).reshape(self.num_envs, -1)
-            infos_last["intervene_flag"] = torch.stack(raw_chunk_intervene_flag, dim=1)
-            infos_list[-1] = infos_last
-
-        if past_dones.any() and self.auto_reset:
-            obs_list[-1], infos_list[-1] = self._handle_auto_reset(
-                past_dones.cpu().numpy(), obs_list[-1], infos_list[-1]
-            )
-
-        if self.auto_reset or self.ignore_terminations:
-            chunk_terminations = torch.zeros_like(raw_chunk_terminations)
-            chunk_terminations[:, -1] = past_terminations
-
-            chunk_truncations = torch.zeros_like(raw_chunk_truncations)
-            chunk_truncations[:, -1] = past_truncations
-        else:
-            chunk_terminations = raw_chunk_terminations.clone()
-            chunk_truncations = raw_chunk_truncations.clone()
-        return (
-            obs_list,
-            chunk_rewards,
-            chunk_terminations,
-            chunk_truncations,
-            infos_list,
-        )
+        return run_realworld_chunk_step(self, chunk_actions)
 
     def _handle_auto_reset(self, dones, _final_obs, infos):
         final_obs = copy.deepcopy(_final_obs)

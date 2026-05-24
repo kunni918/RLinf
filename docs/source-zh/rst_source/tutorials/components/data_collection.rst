@@ -38,9 +38,9 @@ Episode 数据采集
   将重置后的初始观测带入下一 episode。
 - 写入操作在独立后台线程异步执行，不阻塞 RL 训练主循环。
 - LeRobot writer 在第一条 episode 写入时懒初始化，自动推断图像尺寸、状态维度、动作维度。
-- LeRobot 导出支持保存 ``image`` 与 ``extra_view_image``；当 ``extra_view_images``
-  为 ``[N, H, W, C]`` 多视角堆叠时，会自动按索引展开成 ``extra_view_image-0``、
-  ``extra_view_image-1`` …… 等列。
+- LeRobot 导出支持保存 ``image``、``wrist_image`` 与 ``extra_view_image``；
+  当 ``wrist_images`` / ``extra_view_images`` 为 ``[N, H, W, C]`` 多视角堆叠时，
+  会自动按索引展开成 ``wrist_image-0``、``extra_view_image-0`` …… 等列。
 - ``only_success=True`` 可过滤失败 episode，节省磁盘空间。
 
 构造参数
@@ -207,13 +207,26 @@ Episode 数据采集
      - 说明
    * - ``image``
      - 主摄像头图像（bytes + path），uint8
+   * - ``next_image``
+     - 用于 replay-buffer 转换的下一步主摄像头图像，uint8
+   * - ``wrist_image`` / ``wrist_image-N``
+     - 腕部摄像头图像（bytes + path），uint8；多视角堆叠时展开为
+       ``wrist_image-0``、``wrist_image-1`` ……
+   * - ``next_wrist_image`` / ``next_wrist_image-N``
+     - 下一步腕部摄像头图像，使用相同的多视角展开规则
    * - ``extra_view_image`` / ``extra_view_image-N``
      - 额外视角图像（bytes + path），uint8；多视角堆叠时展开为
        ``extra_view_image-0``、``extra_view_image-1`` …… 无额外视角时列为空
+   * - ``next_extra_view_image`` / ``next_extra_view_image-N``
+     - 下一步额外视角图像，使用相同的多视角展开规则
    * - ``state``
      - 机器人状态向量，``float32[state_dim]``
+   * - ``next_state``
+     - 下一步机器人状态向量，``float32[state_dim]``
    * - ``actions``
      - 动作向量，``float32[action_dim]``
+   * - ``rewards``
+     - 与 ``actions`` 对齐的 transition reward，``float32[1]``
    * - ``timestamp``
      - 帧时间戳（秒），``float``
    * - ``frame_index``
@@ -226,6 +239,8 @@ Episode 数据采集
      - 任务编号（对应 tasks.jsonl），``int64``
    * - ``done``
      - 每步的结束标志，``bool``（episode 最后一步为 ``True``）
+   * - ``terminated`` / ``truncated``
+     - 与 ``actions`` 对齐的 Gymnasium 终止和截断标志
    * - ``is_success``
      - 该 episode 是否成功，``bool``
 
@@ -239,6 +254,9 @@ Episode 数据采集
      - 查找键（按优先级）
    * - 主图像
      - ``main_images`` → ``image`` → ``full_image``
+   * - 腕部图像
+     - ``wrist_images`` → ``wrist_image``（``[N, H, W, C]`` 会按索引展开为
+       ``wrist_image-0``、``wrist_image-1`` ……）
    * - 额外视角图像
      - ``extra_view_images`` → ``extra_view_image``（``[N, H, W, C]`` 会按索引
        展开为 ``extra_view_image-0``、``extra_view_image-1`` ……）
@@ -246,6 +264,9 @@ Episode 数据采集
      - ``states`` → ``state``
 
 图像会自动转换为 uint8（浮点 [0, 1] 乘以 255，或直接截断转换）。
+
+全为空值的可选图像列会在 replay-buffer 转换时视为不存在；同一 episode
+内部分为空、部分有值的可选图像列会 fail fast，避免相机 schema 静默变化。
 
 成功状态判断逻辑
 ~~~~~~~~~~~~~~~~
@@ -450,7 +471,7 @@ wrapper 从 info 字典中按以下优先级推断 episode 是否成功（从最
 
 - 优先保证轨迹质量：成功率低时减小 ``success_hold_steps``，降低判定门槛，
   或在 ``target_ee_pose`` 设置更宽松的容差。
-- 收集完成后可用 ``TrajectoryReplayBuffer.load()`` 检查数据条数，
+- 收集完成后可用 ``TrajectoryReplayBuffer.load_checkpoint()`` 检查数据条数，
   确认达到预期数量后再启动训练。
 - 如需追加数据，只需重新运行脚本并指向同一 ``demos`` 目录，
   buffer 的 ``auto_save=True`` 会增量写入而不覆盖已有轨迹。

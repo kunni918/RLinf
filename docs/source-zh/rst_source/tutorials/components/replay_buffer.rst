@@ -70,7 +70,64 @@ Replay Buffer 使用教程
 
 保存 checkpoint 时会把缓存轨迹与 metadata 一并写入 checkpoint 路径。
 加载时需要设置 `load_path` 指向包含 metadata 和轨迹文件的 checkpoint 目录。
-轨迹数据保存格式为 `trajectory_{trajectory_id}_{model_weights_uuid}_{model_update_count}.{trajectory_format}`。
+轨迹数据保存格式为
+``trajectory_{trajectory_id}_{model_weights_id}.{pt|pkl}``。
+
+转换本地 LeRobot 数据集
+---------------------------
+
+``algorithm.demo_buffer.load_path`` 需要指向 ``TrajectoryReplayBuffer``
+checkpoint，而不是原始 LeRobot parquet 目录。若已有本地 LeRobot 格式数据集
+root（``data/**/*.parquet``），或 RLinf 采集器生成的 ``collected_data/`` 父目录
+（其下包含 ``rank_*/id_*/data/**/*.parquet`` root），先转换：
+
+.. code-block:: bash
+
+   python -m rlinf.data.lerobot_replay_buffer \
+     --dataset-path /path/to/lerobot_dataset \
+     --save-path /path/to/replay_buffer_demo
+
+转换器会解码 image 列中的数组、PIL image、编码后的 ``bytes`` payload，或相对
+本地 LeRobot dataset root 的路径。若 image payload 无法解码，转换器默认会
+fail fast。全为空值的可选图像列会视为不存在；同一 episode 内部分为空、
+部分有值的可选图像列会 fail fast，确保相机 schema 稳定。仅在明确需要
+state/action-only demo buffer，且训练配置使用 state-only actor model 时，
+才使用 ``--state-only``。不要把 ``--state-only`` 产物用于 ``cnn_policy``
+或 image ``flow_policy`` 等图像 SAC/RLPD 配置：
+
+.. code-block:: bash
+
+   python -m rlinf.data.lerobot_replay_buffer \
+     --dataset-path /path/to/collected_data \
+     --save-path /path/to/replay_buffer_demo \
+     --state-only
+
+然后在已有 RLPD/SAC ``demo_buffer`` block 中替换 ``load_path``：
+
+.. code-block:: yaml
+
+   algorithm:
+     demo_buffer:
+       enable_cache: True
+       cache_size: 200
+       min_buffer_size: 1
+       sample_window_size: 200
+       load_path: /path/to/replay_buffer_demo
+       load_mode: shard  # demo 数量少于 actor rank 时可改为 replicate
+       auto_save: False
+
+RLinf LeRobot 采集会在每个 action frame 中写入显式 ``next_state`` / ``next_*``
+observation 字段，因此 terminal action、reward、``terminated``、``truncated`` 和
+intervention flag 都会与 source action 对齐。旧数据若没有显式 next observation，
+必须包含 observation-only final frame；否则转换器会 fail fast，而不是静默丢弃
+最后一个 action。若存在拆分的 ``terminated`` / ``truncated`` 字段，转换器会校验
+``done == terminated or truncated``。``wrist_image-0``、``extra_view_image-1``
+等多视角列会被堆叠成 canonical replay key。
+
+``demo_buffer.load_mode`` 默认是 ``shard``，会按 actor rank 切分已加载 demo。
+如果转换后的 demo buffer 数量少于 actor world size，可设为 ``replicate``，让每个
+actor rank 都加载完整 demo buffer。该功能只是 replay/demo-buffer 初始化的数据
+转换路径，不代表完整 HIL-SERL 复现，也不声明训练效果提升。
 
 命令行测试
 --------------

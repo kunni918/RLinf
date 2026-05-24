@@ -222,6 +222,20 @@ class CollectEpisode(gym.Wrapper):
                 if isinstance(infos_list, (list, tuple))
                 else infos_list
             )
+            if isinstance(step_info, dict) and "_valid_step" in step_info:
+                valid_step = np.asarray(
+                    self._to_numpy(step_info["_valid_step"])
+                ).reshape(-1)
+                done_step = np.logical_or(
+                    np.asarray(self._to_numpy(step_term)).reshape(-1),
+                    np.asarray(self._to_numpy(step_trunc)).reshape(-1),
+                )
+                if np.logical_and(
+                    ~valid_step.astype(bool), done_step.astype(bool)
+                ).any():
+                    raise ValueError(
+                        "CollectEpisode received an invalid padded chunk step marked done."
+                    )
             self._record_step(
                 step_action, step_obs, step_reward, step_term, step_trunc, step_info
             )
@@ -274,8 +288,14 @@ class CollectEpisode(gym.Wrapper):
             info_no_reset = copy.deepcopy(info)
             info_no_reset.pop("final_observation")
             info_no_reset.pop("final_info")
+            # `_valid_step` describes the old chunk; it must not carry over
+            # into the next episode's first info entry.
+            info_no_reset.pop("_valid_step", None)
 
         for env_idx in range(self.num_envs):
+            if isinstance(info, dict) and "_valid_step" in info:
+                if not self._scalar_flag(info["_valid_step"], env_idx):
+                    continue
             # Auto-reset envs store the pre-reset obs in info["final_observation"];
             # the current `obs` is the post-reset obs for the *next* episode.
             # Only use final_observation for envs that are actually done this step.
@@ -287,9 +307,7 @@ class CollectEpisode(gym.Wrapper):
                 env_info = self._slice_copy(final_info_batch, env_idx)
                 self._pending_obs[env_idx] = self._slice_copy(obs, env_idx)
                 self._pending_info[env_idx] = self._slice_copy(info_no_reset, env_idx)
-                if "intervene_action" in env_info:
-                    env_info["intervene_action"] = env_info["intervene_action"][-1]
-                    env_info["intervene_flag"] = env_info["intervene_flag"][-1]
+                self._normalize_final_intervention_info(env_info)
             else:
                 env_obs = self._slice_copy(obs, env_idx)
                 env_info = self._slice_copy(info, env_idx)
@@ -389,13 +407,14 @@ class CollectEpisode(gym.Wrapper):
         """Convert a raw episode buffer into a list of per-step frame dicts.
         Produces the format expected by ``LeRobotDatasetWriter.add_episode``:
         a ``list[dict]`` where every dict represents one step and carries the
-        fields ``image``, ``state``, ``actions``, ``task``, ``is_success``,
-        ``done``, ``intervene_flag``, and optionally ``wrist_image`` /
-        ``extra_view_image``.
-        The observations list contains one extra entry prepended at reset time,
-        so it is aligned to the actions list by taking the leading N entries.
-        Steps where any required field (image, state, action) is missing are
-        silently skipped.
+        fields ``state``, ``next_state``, ``actions``, ``rewards``, ``task``,
+        ``is_success``, ``done``, ``terminated``, ``truncated``,
+        ``intervene_flag``, and optional image / next-image fields.
+        The observations list contains one extra entry prepended at reset time.
+        Each LeRobot action frame therefore stores both the source observation
+        and explicit ``next_*`` fields for the transition target observation.
+        Steps where any required state, next_state, or action field is missing
+        are silently skipped.
         Args:
             buf: Raw episode buffer produced by ``_new_buffer``.
             env_idx: Index of the parallel environment this buffer belongs to.
@@ -406,25 +425,43 @@ class CollectEpisode(gym.Wrapper):
         """
         actions = buf["actions"]
         terminated = buf["terminated"]
+        truncated = buf["truncated"]
         obs_steps = buf["observations"]
         if not actions:
             return None
-        if len(obs_steps) > len(actions):
-            obs_steps = obs_steps[: len(actions)]
         task_desc = self._extract_task_description(buf, env_idx)
         steps: list[dict[str, Any]] = []
         first_term_step: Optional[int] = None
         for i, action in enumerate(actions):
             obs = obs_steps[i] if i < len(obs_steps) else None
+            next_obs = obs_steps[i + 1] if i + 1 < len(obs_steps) else None
             image, wrist_image, extra_view_image, state = self._extract_obs_image_state(
                 obs
             )
+            (
+                next_image,
+                next_wrist_image,
+                next_extra_view_image,
+                next_state,
+            ) = self._extract_obs_image_state(next_obs)
             # Overwrite action with intervene action if present.
             np_action = self._to_numpy(action)
             assert "final_info" not in buf["infos"][i + 1], (
                 "final_info should not be present in the info"
             )
             info_with_intervene = copy.deepcopy(buf["infos"][i + 1])
+            reward_value = buf["rewards"][i + 1] if i + 1 < len(buf["rewards"]) else 0.0
+            np_reward = self._to_numpy(reward_value)
+            reward_scalar = (
+                0.0
+                if np_reward is None
+                else float(np.asarray(np_reward).reshape(-1)[0])
+            )
+            terminated_value = terminated[i + 1] if i + 1 < len(terminated) else False
+            truncated_value = truncated[i + 1] if i + 1 < len(truncated) else False
+            terminated_flag = self._to_bool_scalar(terminated_value) or False
+            truncated_flag = self._to_bool_scalar(truncated_value) or False
+            done_flag = terminated_flag or truncated_flag
 
             if (
                 "intervene_flag" in info_with_intervene
@@ -432,35 +469,48 @@ class CollectEpisode(gym.Wrapper):
             ):
                 if info_with_intervene["intervene_flag"].all():
                     np_action = self._to_numpy(info_with_intervene["intervene_action"])
-            if state is None or np_action is None:
+            if state is None or next_state is None or np_action is None:
                 continue
             intervene_flag = self._intervene_flag_from_info(info_with_intervene)
             frame: dict[str, Any] = {
                 "state": np.asarray(state).astype(np.float32),
+                "next_state": np.asarray(next_state).astype(np.float32),
                 "actions": np.asarray(np_action).astype(np.float32).flatten(),
+                "rewards": np.array([reward_scalar], dtype=np.float32),
                 "task": task_desc,
                 "is_success": np.array([is_success], dtype=bool),
-                "done": np.array([False], dtype=bool),
+                "done": np.array([done_flag], dtype=bool),
+                "terminated": np.array([terminated_flag], dtype=bool),
+                "truncated": np.array([truncated_flag], dtype=bool),
                 "intervene_flag": np.array([intervene_flag], dtype=bool),
             }
             if image is not None:
                 frame["image"] = self._to_uint8(np.asarray(image))
+            if next_image is not None:
+                frame["next_image"] = self._to_uint8(np.asarray(next_image))
             for key, img in self._expand_multi_view_images(
                 "wrist_image", wrist_image
+            ).items():
+                frame[key] = self._to_uint8(np.asarray(img))
+            for key, img in self._expand_multi_view_images(
+                "next_wrist_image", next_wrist_image
             ).items():
                 frame[key] = self._to_uint8(np.asarray(img))
             for key, img in self._expand_multi_view_images(
                 "extra_view_image", extra_view_image
             ).items():
                 frame[key] = self._to_uint8(np.asarray(img))
+            for key, img in self._expand_multi_view_images(
+                "next_extra_view_image", next_extra_view_image
+            ).items():
+                frame[key] = self._to_uint8(np.asarray(img))
             steps.append(frame)
-            if bool(terminated[i]) and first_term_step is None:
+            if done_flag and first_term_step is None:
                 first_term_step = len(steps)
         if not steps:
             return None
         end = first_term_step if first_term_step is not None else len(steps)
         steps = steps[:end]
-        steps[-1]["done"] = np.array([True], dtype=bool)
         return steps
 
     def _ensure_lerobot_writer(self, ep_data: dict):
@@ -609,6 +659,53 @@ class CollectEpisode(gym.Wrapper):
         if arr is None:
             return False
         return bool(np.asarray(arr, dtype=bool).reshape(-1).any())
+
+    @staticmethod
+    def _normalize_final_intervention_info(info: Any) -> None:
+        """Keep terminal intervention actions as action vectors after auto-reset."""
+        if not isinstance(info, dict):
+            return
+        if "intervene_action" not in info or "intervene_flag" not in info:
+            return
+
+        action = CollectEpisode._to_numpy(info["intervene_action"])
+        flag = CollectEpisode._to_numpy(info["intervene_flag"])
+        if action is None or flag is None:
+            return
+
+        flag_array = np.asarray(flag, dtype=bool)
+        action_array = np.asarray(action)
+        flat_flags = flag_array.reshape(-1)
+        if flat_flags.size and action_array.ndim == 1:
+            if action_array.size % flat_flags.size == 0:
+                action_array = action_array.reshape(flat_flags.size, -1)
+        if (
+            flat_flags.size
+            and action_array.ndim >= 2
+            and action_array.shape[0] == flat_flags.size
+        ):
+            selected_index = CollectEpisode._terminal_chunk_index(info, flat_flags.size)
+            info["intervene_action"] = action_array[selected_index]
+            info["intervene_flag"] = np.asarray(
+                [flat_flags[selected_index]], dtype=bool
+            )
+            return
+
+        info["intervene_action"] = action_array
+        info["intervene_flag"] = np.asarray(
+            [bool(flat_flags[-1]) if flat_flags.size else False], dtype=bool
+        )
+
+    @staticmethod
+    def _terminal_chunk_index(info: dict[str, Any], num_flags: int) -> int:
+        raw_index = info.get("terminal_chunk_index")
+        if raw_index is None:
+            return num_flags - 1
+        index_array = CollectEpisode._to_numpy(raw_index)
+        if index_array is None:
+            return num_flags - 1
+        selected_index = int(np.asarray(index_array).reshape(-1)[0])
+        return max(0, min(selected_index, num_flags - 1))
 
     @staticmethod
     def _to_bool_scalar(val) -> Optional[bool]:

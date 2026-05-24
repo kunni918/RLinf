@@ -22,7 +22,11 @@ import torch.nn.functional as F
 from omegaconf import DictConfig
 from torch.utils.data import DataLoader
 
-from rlinf.config import SupportedModel
+from rlinf.config import (
+    SupportedModel,
+    validate_demo_buffer_load_mode,
+    validate_embodied_sac_model_type,
+)
 from rlinf.data.embodied_buffer_dataset import (
     PreloadReplayBufferDataset,
     ReplayBufferDataset,
@@ -45,6 +49,12 @@ from rlinf.utils.nested_dict_process import (
 )
 from rlinf.utils.utils import clear_memory
 from rlinf.workers.actor.fsdp_actor_worker import EmbodiedFSDPActor
+from rlinf.workers.actor.sac_demo_buffer_utils import (
+    apply_chunk_mask,
+    chunk_sample_weights,
+    demo_buffer_load_kwargs,
+    validate_loaded_demo_buffer,
+)
 
 
 class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
@@ -61,6 +71,7 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
         self.enable_drq = bool(getattr(self.cfg.actor, "enable_drq", False))
 
     def init_worker(self):
+        validate_embodied_sac_model_type(self.cfg.actor.model, self.cfg.algorithm)
         self.setup_model_and_optimizer(initialize_target=True)
         self.setup_sac_components()
         self.soft_update_target_model(tau=1.0)
@@ -207,11 +218,25 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
             )
             min_demo_buffer_size = self.cfg.algorithm.demo_buffer.min_buffer_size
             if self.cfg.algorithm.demo_buffer.get("load_path", None) is not None:
+                load_path = self.cfg.algorithm.demo_buffer.load_path
                 self.demo_buffer.load_checkpoint(
-                    self.cfg.algorithm.demo_buffer.load_path,
-                    is_distributed=True,
-                    local_rank=self._rank,
+                    load_path,
+                    **demo_buffer_load_kwargs(
+                        self.cfg.algorithm.demo_buffer,
+                        rank=self._rank,
+                        world_size=self._world_size,
+                    ),
+                )
+                validate_loaded_demo_buffer(
+                    self.demo_buffer,
+                    load_path=load_path,
+                    min_demo_buffer_size=min_demo_buffer_size,
+                    rank=self._rank,
                     world_size=self._world_size,
+                    model_cfg=self.cfg.actor.model,
+                    load_mode=validate_demo_buffer_load_mode(
+                        self.cfg.algorithm.demo_buffer
+                    ),
                 )
 
         if self.cfg.algorithm.replay_buffer.get("enable_preload", False):
@@ -462,9 +487,13 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
         # Align dtype: bool ops with Python floats promote to float32,
         # which can mismatch with bfloat16 model outputs.
         target_q_values = target_q_values.to(dtype=all_data_q_values.dtype)
-        critic_loss = F.mse_loss(
-            all_data_q_values, target_q_values.expand_as(all_data_q_values)
+        per_element_se = F.mse_loss(
+            all_data_q_values,
+            target_q_values.expand_as(all_data_q_values),
+            reduction="none",
         )
+        weights = chunk_sample_weights(batch, per_element_se.dtype)
+        critic_loss = apply_chunk_mask(per_element_se, weights)
         return critic_loss, {"q_data": all_data_q_values.mean().item()}
 
     @Worker.timer("forward_actor")
@@ -516,9 +545,10 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
         elif agg_q == "mean":
             qf_pi = torch.mean(all_qf_pi, dim=1, keepdim=True)
         metrics["q_pi"] = qf_pi.mean().item()
-        actor_loss = ((self.entropy_temp.alpha * log_pi) - qf_pi).mean()
-
-        entropy = -log_pi.mean()
+        actor_loss_per = (self.entropy_temp.alpha * log_pi) - qf_pi
+        weights = chunk_sample_weights(batch, actor_loss_per.dtype)
+        actor_loss = apply_chunk_mask(actor_loss_per, weights)
+        entropy = apply_chunk_mask(-log_pi, weights)
         return actor_loss, entropy, metrics
 
     @Worker.timer("forward_alpha")
@@ -540,7 +570,14 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
             log_pi = log_pi.sum(dim=-1, keepdim=True)
 
         alpha = self.entropy_temp.compute_alpha()
-        alpha_loss = -alpha * (log_pi.mean() + self.target_entropy)
+        weights = chunk_sample_weights(batch, log_pi.dtype)
+        log_pi_mean = apply_chunk_mask(log_pi, weights)
+        alpha_loss = -alpha * (log_pi_mean + self.target_entropy)
+        if weights is not None:
+            # Avoid letting `target_entropy` move alpha when the entire batch
+            # was padded; `apply_chunk_mask` returns 0 in that case, but the
+            # `(0 + target_entropy)` term would still drive a spurious update.
+            alpha_loss = alpha_loss * (weights.sum() > 0).to(alpha_loss.dtype)
         return alpha_loss
 
     @Worker.timer("update_one_epoch")

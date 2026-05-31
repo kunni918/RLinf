@@ -71,15 +71,33 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
         self.enable_drq = bool(getattr(self.cfg.actor, "enable_drq", False))
 
     def init_worker(self):
-        validate_embodied_sac_model_type(self.cfg.actor.model, self.cfg.algorithm)
+        # MAJ-R4-7: under ``only_eval`` skip the WHOLE training-only SAC
+        # stack (replay/demo buffer, dataloader, entropy temperature,
+        # alpha optimizer, dataloader iterator, soft target init). Eval
+        # still needs the online model + target model for Q evaluation,
+        # so we initialize those — but skip everything that requires the
+        # training config sections (``algorithm.replay_buffer``,
+        # ``algorithm.demo_buffer``, ``algorithm.entropy_tuning``). This
+        # lets shipped eval-only configs load cleanly without bringing
+        # in training-only validation / requirements.
+        only_eval = bool(self.cfg.runner.only_eval)
+        if not only_eval:
+            validate_embodied_sac_model_type(self.cfg.actor.model, self.cfg.algorithm)
         self.setup_model_and_optimizer(initialize_target=True)
-        self.setup_sac_components()
-        self.soft_update_target_model(tau=1.0)
+        if not only_eval:
+            self.setup_sac_components()
+            self.soft_update_target_model(tau=1.0)
         if self.use_dsrl:
             self._init_target_shadow()
         if self.cfg.actor.get("enable_offload", False):
             self.offload_param_and_grad()
-            self.offload_optimizer()
+            # CRIT-R8: under ``only_eval`` the optimizers are None
+            # because we skipped ``build_optimizers`` (no training-only
+            # config sections required). ``offload_optimizer()`` would
+            # dereference ``self.optimizer.state`` → AttributeError.
+            # Param offload is still valid (the model exists).
+            if not only_eval:
+                self.offload_optimizer()
         if self.cfg.actor.get("compile_model", False):
             self.model = torch.compile(
                 self.model, mode="default"
@@ -117,47 +135,57 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
             self.target_model_initialized = True
 
         self.use_dsrl = self.cfg.actor.model.get("openpi", {}).get("use_dsrl", False)
-        use_dsrl = self.use_dsrl
-        if use_dsrl:
-            # DSRL: separate actor/critic encoders into different optimizer groups
-            param_filters = {
-                "critic": ["critic_image_encoder", "critic_state_encoder", "q_head"]
-            }
+        # MAJ-R4-7: SAC training-only initialization MUST be skipped under
+        # ``runner.only_eval``. The eval config schema does not require
+        # ``actor.critic_optim`` / ``actor.optim`` / ``algorithm.entropy_tuning``
+        # sections (e.g. ``realworld_eval.yaml``), so attempting to build
+        # optimizers / entropy temperature would crash with KeyError before
+        # reaching the deliberately-skipped ``setup_sac_components``.
+        if self.cfg.runner.only_eval:
+            self.optimizer = None
+            self.qf_optimizer = None
         else:
-            param_filters = {"critic": ["encoders", "encoder", "q_head", "state_proj"]}
-        filtered_optim_config = {"critic": self.cfg.actor.critic_optim}
-        optimizers = self.build_optimizers(
-            model=self.model,
-            main_optim_config=self.cfg.actor.optim,
-            param_filters=param_filters,
-            filtered_optim_config=filtered_optim_config,
-        )
-        self.optimizer = optimizers[0]
-        self.qf_optimizer = optimizers[1]
-
-        # SAC alpha
-        # Initialize temperature parameter for automatic entropy tuning
-        alpha_type = self.cfg.algorithm.entropy_tuning.get(
-            "alpha_type", "softplus"
-        )  # supported type: ["softplus","exp","fixed_alpha"]
-        self.entropy_temp = EntropyTemperature(
-            initial_alpha=self.cfg.algorithm.entropy_tuning.get("initial_alpha", 0.01),
-            alpha_type=alpha_type,
-            device=self.device,
-            dtype=self.torch_dtype,
-        )
-        if alpha_type != "fixed_alpha":
-            self.target_entropy = self.cfg.algorithm.entropy_tuning.get(
-                "target_entropy",
-                -self.cfg.actor.model.action_dim,
+            use_dsrl = self.use_dsrl
+            if use_dsrl:
+                # DSRL: separate actor/critic encoders into different optimizer groups
+                param_filters = {
+                    "critic": ["critic_image_encoder", "critic_state_encoder", "q_head"]
+                }
+            else:
+                param_filters = {"critic": ["encoders", "encoder", "q_head", "state_proj"]}
+            filtered_optim_config = {"critic": self.cfg.actor.critic_optim}
+            optimizers = self.build_optimizers(
+                model=self.model,
+                main_optim_config=self.cfg.actor.optim,
+                param_filters=param_filters,
+                filtered_optim_config=filtered_optim_config,
             )
+            self.optimizer = optimizers[0]
+            self.qf_optimizer = optimizers[1]
 
-            self.alpha_optimizer = torch.optim.Adam(
-                self.entropy_temp.parameters(),
-                lr=self.cfg.algorithm.entropy_tuning.optim.lr,
+            # SAC alpha
+            # Initialize temperature parameter for automatic entropy tuning
+            alpha_type = self.cfg.algorithm.entropy_tuning.get(
+                "alpha_type", "softplus"
+            )  # supported type: ["softplus","exp","fixed_alpha"]
+            self.entropy_temp = EntropyTemperature(
+                initial_alpha=self.cfg.algorithm.entropy_tuning.get("initial_alpha", 0.01),
+                alpha_type=alpha_type,
+                device=self.device,
+                dtype=self.torch_dtype,
             )
+            if alpha_type != "fixed_alpha":
+                self.target_entropy = self.cfg.algorithm.entropy_tuning.get(
+                    "target_entropy",
+                    -self.cfg.actor.model.action_dim,
+                )
 
-        self.build_lr_schedulers()
+                self.alpha_optimizer = torch.optim.Adam(
+                    self.entropy_temp.parameters(),
+                    lr=self.cfg.algorithm.entropy_tuning.optim.lr,
+                )
+
+            self.build_lr_schedulers()
 
         self.grad_scaler = self.build_grad_scaler(
             self.cfg.actor.fsdp_config.grad_scaler
@@ -493,8 +521,8 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
             reduction="none",
         )
         weights = chunk_sample_weights(batch, per_element_se.dtype)
-        critic_loss = apply_chunk_mask(per_element_se, weights)
-        return critic_loss, {"q_data": all_data_q_values.mean().item()}
+        critic_loss, valid_count = apply_chunk_mask(per_element_se, weights)
+        return critic_loss, valid_count, {"q_data": all_data_q_values.mean().item()}
 
     @Worker.timer("forward_actor")
     def forward_actor(self, batch):
@@ -547,9 +575,9 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
         metrics["q_pi"] = qf_pi.mean().item()
         actor_loss_per = (self.entropy_temp.alpha * log_pi) - qf_pi
         weights = chunk_sample_weights(batch, actor_loss_per.dtype)
-        actor_loss = apply_chunk_mask(actor_loss_per, weights)
-        entropy = apply_chunk_mask(-log_pi, weights)
-        return actor_loss, entropy, metrics
+        actor_loss, valid_count = apply_chunk_mask(actor_loss_per, weights)
+        entropy, _ = apply_chunk_mask(-log_pi, weights)
+        return actor_loss, entropy, valid_count, metrics
 
     @Worker.timer("forward_alpha")
     def forward_alpha(self, batch):
@@ -571,14 +599,14 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
 
         alpha = self.entropy_temp.compute_alpha()
         weights = chunk_sample_weights(batch, log_pi.dtype)
-        log_pi_mean = apply_chunk_mask(log_pi, weights)
+        log_pi_mean, valid_count = apply_chunk_mask(log_pi, weights)
         alpha_loss = -alpha * (log_pi_mean + self.target_entropy)
         if weights is not None:
             # Avoid letting `target_entropy` move alpha when the entire batch
             # was padded; `apply_chunk_mask` returns 0 in that case, but the
             # `(0 + target_entropy)` term would still drive a spurious update.
             alpha_loss = alpha_loss * (weights.sum() > 0).to(alpha_loss.dtype)
-        return alpha_loss
+        return alpha_loss, valid_count
 
     @Worker.timer("update_one_epoch")
     def update_one_epoch(self, train_actor: bool = True):
@@ -605,72 +633,136 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
         self.qf_optimizer.zero_grad()
         gbs_critic_loss = []
         all_critic_metrics = {}
+        critic_valid_local = 0
         for batch in train_micro_batch_list:
-            critic_loss, critic_metrics = self.forward_critic(batch)
+            critic_loss, critic_valid, critic_metrics = self.forward_critic(batch)
             critic_loss = critic_loss / self.gradient_accumulation
+            # ALWAYS call backward — `apply_chunk_mask` now returns a
+            # graph-connected zero when local valid==0, so backward is safe
+            # and FSDP collectives stay consistent across ranks. Otherwise
+            # the rank-local skip would deadlock peers that did call backward.
             critic_loss.backward()
             gbs_critic_loss.append(critic_loss.item() * self.gradient_accumulation)
+            critic_valid_local += int(critic_valid)
             append_to_dict(all_critic_metrics, critic_metrics)
         all_critic_metrics = {
             f"critic/{key}": np.mean(value) for key, value in all_critic_metrics.items()
         }
-        qf_grad_norm = self.model.clip_grad_norm_(
-            max_norm=self.cfg.actor.critic_optim.clip_grad
-        )
+        # FSDP / SAC collectives (clip_grad_norm_, optimizer.step on sharded
+        # params, alpha all_reduce) MUST be entered identically on every rank
+        # or the process group will deadlock. Gate them on the GLOBAL valid
+        # count, not the per-rank local count. Ranks with locally zero valid
+        # samples still enter every collective with zero grads — clip and
+        # step are no-ops for zero grads but stay synchronised.
+        critic_valid_total = self._global_valid_count(critic_valid_local)
+        if critic_valid_total > 0:
+            qf_grad_norm = self.model.clip_grad_norm_(
+                max_norm=self.cfg.actor.critic_optim.clip_grad
+            )
 
-        self.qf_optimizer.step()
-        self.qf_lr_scheduler.step()
+            self.qf_optimizer.step()
+            self.qf_lr_scheduler.step()
+        else:
+            # Every rank saw only padded chunks -- skip optimizer.step() and
+            # scheduler.step() so weight decay / momentum / LR schedule don't
+            # advance on a synthetic zero loss.
+            qf_grad_norm = 0.0
 
         metrics_data = {
             "sac/critic_loss": np.mean(gbs_critic_loss),
             "critic/lr": self.qf_optimizer.param_groups[0]["lr"],
             "critic/grad_norm": qf_grad_norm,
+            "critic/valid_count": critic_valid_total,
             **all_critic_metrics,
         }
 
+        actor_valid_total = 0
         if self.update_step % self.critic_actor_ratio == 0 and train_actor:
+            # MAJ-R4-5: also zero the critic optimizer's params before the
+            # actor pass. ``optimizer.step()`` does NOT clear grads, so
+            # stale critic grads on shared ``q_head`` / ``q_target`` params
+            # would otherwise contaminate the model-wide
+            # ``clip_grad_norm_`` and the optimizer step below.
+            self.qf_optimizer.zero_grad()
             self.optimizer.zero_grad()
             gbs_actor_loss = []
             gbs_entropy = []
+            actor_valid_local = 0
             all_actor_metrics = {}
             for batch in train_micro_batch_list:
-                actor_loss, entropy, q_metrics = self.forward_actor(batch)
+                actor_loss, entropy, actor_valid, q_metrics = self.forward_actor(batch)
                 actor_loss = actor_loss / self.gradient_accumulation
+                # Always backward; see critic loop comment for the FSDP
+                # collective-consistency rationale.
                 actor_loss.backward()
                 gbs_actor_loss.append(actor_loss.item() * self.gradient_accumulation)
                 gbs_entropy.append(entropy.item())
+                actor_valid_local += int(actor_valid)
                 append_to_dict(all_actor_metrics, q_metrics)
             all_actor_metrics = {
                 f"actor/{key}": np.mean(value)
                 for key, value in all_actor_metrics.items()
             }
-            actor_grad_norm = self.model.clip_grad_norm_(
-                max_norm=self.cfg.actor.optim.clip_grad
-            )
-            self.optimizer.step()
-            self.lr_scheduler.step()
+            # Use the global valid count to gate FSDP-collective optimizer/clip
+            # calls; otherwise ranks with locally zero valid samples would skip
+            # the collective and the others would hang.
+            actor_valid_total = self._global_valid_count(actor_valid_local)
+            # MAJ-R4-5 (post-backward leg): actor.backward() writes fresh
+            # grads on the critic's ``q_head`` params via the q_pi path
+            # (encoder is detached but q_head is not). Zero those before
+            # the model-wide ``clip_grad_norm_`` so the actor's clip
+            # norm is not contaminated by q_head grads that no actor
+            # optimizer.step will consume.
+            self.qf_optimizer.zero_grad()
+            if actor_valid_total > 0:
+                actor_grad_norm = self.model.clip_grad_norm_(
+                    max_norm=self.cfg.actor.optim.clip_grad
+                )
+                self.optimizer.step()
+                self.lr_scheduler.step()
+            else:
+                actor_grad_norm = 0.0
 
             # Update temperature parameter if using automatic entropy tuning
             gbs_alpha_loss = [0]
             alpha_grad_norm = 0
+            alpha_valid_total = 0
             if self.alpha_optimizer is not None:
+                # MAJ-R4-5 (alpha-side): wipe both model optimizers'
+                # accumulated grads so the alpha backward path doesn't
+                # accidentally see stale grads via shared FSDP graphs.
+                self.qf_optimizer.zero_grad()
+                self.optimizer.zero_grad()
                 self.alpha_optimizer.zero_grad()
                 gbs_alpha_loss = []
+                alpha_valid_local = 0
                 for batch in train_micro_batch_list:
-                    alpha_loss = self.forward_alpha(batch) / self.gradient_accumulation
+                    alpha_loss, alpha_valid = self.forward_alpha(batch)
+                    alpha_loss = alpha_loss / self.gradient_accumulation
+                    # Always backward; see critic loop. This also guarantees
+                    # ``self.entropy_temp.base_alpha.grad`` is populated (even
+                    # if zero) on every rank, so the subsequent all_reduce
+                    # below doesn't crash on local-zero ranks where the grad
+                    # would otherwise be None.
                     alpha_loss.backward()
                     gbs_alpha_loss.append(
                         alpha_loss.item() * self.gradient_accumulation
                     )
-                torch.distributed.all_reduce(
-                    self.entropy_temp.base_alpha.grad, op=torch.distributed.ReduceOp.AVG
-                )
-                alpha_grad_norm = torch.nn.utils.clip_grad_norm_(
-                    self.entropy_temp.base_alpha,
-                    self.cfg.algorithm.entropy_tuning.optim.clip_grad,
-                )
-                self.alpha_optimizer.step()
-                self.alpha_lr_scheduler.step()
+                    alpha_valid_local += int(alpha_valid)
+                # Same FSDP-collective hazard: the alpha all_reduce must be
+                # called identically on every rank to avoid deadlock.
+                alpha_valid_total = self._global_valid_count(alpha_valid_local)
+                if alpha_valid_total > 0:
+                    torch.distributed.all_reduce(
+                        self.entropy_temp.base_alpha.grad,
+                        op=torch.distributed.ReduceOp.AVG,
+                    )
+                    alpha_grad_norm = torch.nn.utils.clip_grad_norm_(
+                        self.entropy_temp.base_alpha,
+                        self.cfg.algorithm.entropy_tuning.optim.clip_grad,
+                    )
+                    self.alpha_optimizer.step()
+                    self.alpha_lr_scheduler.step()
 
             # Collect metrics
             metrics_data.update(
@@ -681,18 +773,69 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
                     "actor/lr": self.optimizer.param_groups[0]["lr"],
                     "actor/grad_norm": actor_grad_norm,
                     "actor/entropy": np.mean(gbs_entropy),
+                    "actor/valid_count": actor_valid_total,
                     "alpha/grad_norm": alpha_grad_norm,
                     **all_actor_metrics,
                 }
             )
-        # Soft update target network
+        # Soft update target network. Skip the soft update entirely when EVERY
+        # rank saw zero valid samples (critic_valid_total is the global
+        # all-reduced value); otherwise the target network drifts toward the
+        # current online weights even though no real learning signal was
+        # applied this step. Gating on the global value keeps every rank
+        # consistent so the soft-update collective is entered identically.
         if (
             self.target_model_initialized
+            and critic_valid_total > 0
             and self.update_step % self.cfg.algorithm.get("target_update_freq", 1) == 0
         ):
             self.soft_update_target_model()
 
         return metrics_data
+
+    def _global_valid_count(self, local_count: int) -> int:
+        """All-reduce SUM the local per-rank valid sample count.
+
+        FSDP-wrapped clip_grad_norm_(), optimizer.step() and the alpha
+        all_reduce are collective: every rank must enter / skip them in
+        lock-step or the process group deadlocks. We therefore gate those
+        branches on the GLOBAL valid count, not the per-rank local one.
+
+        Falls back to ``local_count`` for non-distributed runs (single GPU,
+        unit tests).
+        """
+        if (
+            torch.distributed.is_available()
+            and torch.distributed.is_initialized()
+        ):
+            count_tensor = torch.tensor(
+                [int(local_count)], dtype=torch.long, device=self.device
+            )
+            torch.distributed.all_reduce(
+                count_tensor, op=torch.distributed.ReduceOp.SUM
+            )
+            return int(count_tensor.item())
+        return int(local_count)
+
+    def _global_all_ranks(self, local_bool: bool) -> bool:
+        """All-reduce MIN the per-rank bool — True only if every rank is True.
+
+        Used for branching decisions (replay-buffer readiness, actor-warmup)
+        that must be taken identically on every rank to keep subsequent
+        FSDP collectives in sync. CRIT-R4-2.
+        """
+        if (
+            torch.distributed.is_available()
+            and torch.distributed.is_initialized()
+        ):
+            flag_tensor = torch.tensor(
+                [1 if local_bool else 0], dtype=torch.long, device=self.device
+            )
+            torch.distributed.all_reduce(
+                flag_tensor, op=torch.distributed.ReduceOp.MIN
+            )
+            return bool(int(flag_tensor.item()))
+        return bool(local_bool)
 
     def process_train_metrics(self, metrics):
         replay_buffer_stats = self.replay_buffer.get_stats()
@@ -738,18 +881,48 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
             self.load_param_and_grad(self.device)
             self.load_optimizer(self.device)
 
-        # Check if replay buffer has enough samples
+        # Check if replay buffer has enough samples. CRIT-R4-2: these
+        # branches MUST be globally agreed across all FSDP ranks or the
+        # process group deadlocks. One rank returning early while peers
+        # enter ``update_one_epoch`` (which calls FSDP-collective
+        # backward/clip/all_reduce) hangs the run. We all-reduce the
+        # local readiness as an AND so every rank takes the same branch.
         min_buffer_size = self.cfg.algorithm.replay_buffer.get("min_buffer_size", 100)
-        if not self.replay_buffer.is_ready(min_buffer_size):
+        local_ready = bool(self.replay_buffer.is_ready(min_buffer_size))
+        if not self._global_all_ranks(local_ready):
             self.log_on_first_rank(
-                f"Replay buffer size {len(self.replay_buffer)} < {min_buffer_size}, skipping training"
+                f"Replay buffer size {len(self.replay_buffer)} < {min_buffer_size} "
+                "on some rank, skipping training"
             )
             return {}
 
-        # Delay actor training until buffer has enough samples
+        # Demo buffer readiness MUST also be globally agreed: the
+        # ``EmbodiedBufferDataset`` blocks until BOTH replay and demo are
+        # ready (per-rank), so a single rank with a demo shard short of
+        # ``min_demo_buffer_size`` would block forever while peers enter
+        # FSDP collectives. Gate globally before ``next(dataloader)``.
+        if self.demo_buffer is not None:
+            min_demo_buffer_size = self.cfg.algorithm.demo_buffer.get(
+                "min_buffer_size", 0
+            )
+            local_demo_ready = bool(
+                self.demo_buffer.is_ready(min_demo_buffer_size)
+            )
+            if not self._global_all_ranks(local_demo_ready):
+                self.log_on_first_rank(
+                    f"Demo buffer size {len(self.demo_buffer)} < "
+                    f"{min_demo_buffer_size} on some rank, skipping training"
+                )
+                return {}
+
+        # Delay actor training until buffer has enough samples — also
+        # globally agreed (AND across ranks) so every rank skips the actor
+        # path together.
         train_actor_steps = self.cfg.algorithm.get("train_actor_steps", 0)
         train_actor_steps = max(min_buffer_size, train_actor_steps)
-        train_actor = self.replay_buffer.is_ready(train_actor_steps)
+        train_actor = self._global_all_ranks(
+            bool(self.replay_buffer.is_ready(train_actor_steps))
+        )
 
         assert (
             self.cfg.actor.global_batch_size
@@ -769,7 +942,15 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
         for _ in range(update_epoch):
             metrics_data = self.update_one_epoch(train_actor=train_actor)
             append_to_dict(metrics, metrics_data)
-            self.update_step += 1
+            # MAJ-R4-6: only advance ``update_step`` when the critic
+            # optimizer actually stepped (i.e. the GLOBAL valid count
+            # was positive). Advancing on an all-padded global batch
+            # would skew ``critic_actor_ratio`` and ``target_update_freq``
+            # scheduling. ``critic/valid_count`` is the metric we just
+            # appended above.
+            critic_valid_total = int(metrics_data.get("critic/valid_count", 0))
+            if critic_valid_total > 0:
+                self.update_step += 1
 
         mean_metric_dict = self.process_train_metrics(metrics)
 

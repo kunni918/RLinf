@@ -14,6 +14,7 @@
 
 import copy
 import io
+import os
 import subprocess
 import sys
 from types import SimpleNamespace
@@ -23,6 +24,11 @@ import numpy as np
 import pytest
 import torch
 from omegaconf import OmegaConf
+
+# T11: Pillow is a required test-time dep for the image-decode coverage. Import
+# directly so missing Pillow becomes a collection ERROR (loud) rather than a
+# SKIP outcome (silent). The CI base image must ship Pillow.
+import PIL.Image  # noqa: F401
 
 from rlinf.data.lerobot_replay_buffer import (
     convert_lerobot_dataset_to_replay_buffer,
@@ -172,7 +178,11 @@ def test_lerobot_episode_uses_explicit_final_observation_for_terminal_action():
     frames = [
         _frame(0),
         _frame(1, done=True),
-        _frame(2),
+        # Obs-only target frame: mirror the action frame's positive terminal
+        # flag so MAJ-11 source/target agreement does not raise. The legacy
+        # silent-source-wins behaviour was rejected this round; producers
+        # must keep terminal flags consistent across source/target frames.
+        _frame(2, done=True),
     ]
     frames[-1].pop("actions")
 
@@ -1867,21 +1877,33 @@ def test_env_worker_reward_input_collapses_chunk_dones_with_any():
 
 
 class _FakeDemoBuffer:
+    """Fake demo buffer exposing the new public API.
+
+    Mirrors :class:`TrajectoryReplayBuffer`'s public
+    ``iter_trajectory_metadata()`` / ``load_trajectory()`` contract that
+    :func:`validate_loaded_demo_buffer` now relies on (consensus MAJ-8).
+    """
+
     def __init__(self, trajectories: list[SimpleNamespace]):
-        self._trajectory_id_list = list(range(len(trajectories)))
-        self._trajectory_index = {
-            trajectory_id: {"model_weights_id": "test"}
-            for trajectory_id in self._trajectory_id_list
-        }
         self._trajectories = trajectories
+        # Build a tiny metadata index that mimics the production buffer.
+        self._index = [
+            (trajectory_id, "test", 1)
+            for trajectory_id in range(len(trajectories))
+        ]
 
     def __len__(self):
-        return len(self._trajectory_id_list)
+        return len(self._trajectories)
 
     def is_ready(self, min_size: int) -> bool:
         return len(self) >= min_size
 
-    def _load_trajectory(self, trajectory_id: int, model_weights_id: str):
+    def iter_trajectory_metadata(self):
+        """Yield ``(trajectory_id, model_weights_id, num_samples)``."""
+        for entry in self._index:
+            yield entry
+
+    def load_trajectory(self, trajectory_id: int, model_weights_id: str):
         return self._trajectories[trajectory_id]
 
 
@@ -2315,24 +2337,28 @@ def test_sac_apply_chunk_mask_matches_mean_when_weights_none():
 
     per_sample = torch.tensor([[1.0, 2.0], [3.0, 4.0]])
     assert chunk_sample_weights({}, torch.float32) is None
-    torch.testing.assert_close(
-        apply_chunk_mask(per_sample, None), per_sample.mean()
-    )
+    loss, valid_count = apply_chunk_mask(per_sample, None)
+    torch.testing.assert_close(loss, per_sample.mean())
+    assert valid_count == per_sample.shape[0]
 
 
 def test_sac_apply_chunk_mask_excludes_zero_weighted_samples():
     """An all-zero mask gives 0 loss with no NaN, and partial mask correctly
-    averages over only the valid samples and feature axis."""
+    averages over only the valid samples and feature axis. The function now
+    also returns a ``valid_count`` so callers can skip optimizer/scheduler
+    advance when zero (MAJ-4)."""
     from rlinf.workers.actor.sac_demo_buffer_utils import apply_chunk_mask
 
     per_sample = torch.tensor([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]])
     weights_all_zero = torch.zeros(2, 1)
-    out = apply_chunk_mask(per_sample, weights_all_zero)
+    out, valid_count = apply_chunk_mask(per_sample, weights_all_zero)
     assert torch.isfinite(out).all() and out.item() == 0.0
+    assert valid_count == 0
 
     weights_first_only = torch.tensor([[1.0], [0.0]])
-    out = apply_chunk_mask(per_sample, weights_first_only)
+    out, valid_count = apply_chunk_mask(per_sample, weights_first_only)
     torch.testing.assert_close(out, torch.tensor(2.0))
+    assert valid_count == 1
 
 
 def test_lerobot_trajectory_emits_all_true_loss_mask():
@@ -2375,3 +2401,1536 @@ def test_sac_chunk_sample_weights_requires_all_chunk_substeps_valid():
     }
     weights = chunk_sample_weights(batch, torch.float32)
     torch.testing.assert_close(weights, torch.tensor([[1.0], [0.0]]))
+
+
+# ---------------------------------------------------------------------------
+# T1-T11 — Round 1 consensus gap-closing tests.
+# Each test is annotated with the CRIT/MAJ consensus item it exercises.
+# ---------------------------------------------------------------------------
+
+
+def test_lerobot_demo_and_chunked_rollout_loss_mask_concat_roundtrip():
+    """T1 — Multi-chunk ``loss_mask`` roundtrip (CRIT-1 (a), (b), (c)).
+
+    The original C2 bug let the LeRobot demo emit a ``[T, 1, 1]`` mask while a
+    chunked-rollout emitted ``[T, B, num_chunks]``: ``concat_batch`` would
+    raise (or silently drop) when the trailing chunk dims disagreed. After the
+    F1 fix the LeRobot mask shape derives from ``actions`` so it ends up
+    ``[T, 1, 1]`` (equivalent to ``num_action_chunks=1``) and concatenates
+    cleanly with a single-chunk rollout batch.
+
+    The test exercises the actual ``lerobot_episode_to_trajectory`` →
+    ``convert_trajectories_to_batch`` → ``concat_batch`` pipeline so it would
+    have caught the original C2 bug.
+    """
+    from rlinf.data.embodied_io_struct import convert_trajectories_to_batch
+    from rlinf.utils.nested_dict_process import concat_batch
+
+    # Build a LeRobot demo trajectory with T=2 frames.  Its mask shape ends up
+    # ``[T=2, B=1, 1]`` — see the comment in
+    # ``lerobot_episode_to_trajectory`` near the ``loss_mask_tensor`` build.
+    demo_frames = [
+        _frame_with_next(0),
+        _frame_with_next(1, done=True, terminated=True),
+    ]
+    demo_trajectory = lerobot_episode_to_trajectory(demo_frames)
+    assert demo_trajectory.loss_mask is not None
+    assert demo_trajectory.loss_mask.shape == (2, 1, 1)
+
+    # Build a chunked-rollout trajectory whose loss_mask is shaped the same as
+    # the demo (``num_action_chunks == 1``) so that both producers agree on
+    # the trailing dim.  ``convert_trajectories_to_batch`` stacks each side on
+    # the batch dim and ``concat_batch`` joins them along dim=0.
+    rollout_trajectory = SimpleNamespace(
+        max_episode_length=4,
+        actions=torch.zeros(4, 1, 1),
+        rewards=torch.zeros(4, 1, 1),
+        terminations=torch.zeros(4, 1, 1, dtype=torch.bool),
+        truncations=torch.zeros(4, 1, 1, dtype=torch.bool),
+        dones=torch.zeros(4, 1, 1, dtype=torch.bool),
+        loss_mask=torch.ones(4, 1, 1, dtype=torch.bool),
+        intervene_flags=torch.zeros(4, 1, 1, dtype=torch.bool),
+        forward_inputs={},
+        curr_obs={"states": torch.zeros(4, 1, 2)},
+        next_obs={"states": torch.zeros(4, 1, 2)},
+        prev_logprobs=None,
+        prev_values=None,
+        versions=None,
+        model_weights_id="rollout",
+    )
+    # Reuse the real ``Trajectory`` dataclass instead of a SimpleNamespace so
+    # ``convert_trajectories_to_batch`` can iterate ``__dataclass_fields__``.
+    from rlinf.data.embodied_io_struct import Trajectory
+
+    rollout_real = Trajectory(
+        max_episode_length=4,
+        actions=rollout_trajectory.actions,
+        rewards=rollout_trajectory.rewards,
+        terminations=rollout_trajectory.terminations,
+        truncations=rollout_trajectory.truncations,
+        dones=rollout_trajectory.dones,
+        loss_mask=rollout_trajectory.loss_mask,
+        intervene_flags=rollout_trajectory.intervene_flags,
+        forward_inputs={},
+        curr_obs=rollout_trajectory.curr_obs,
+        next_obs=rollout_trajectory.next_obs,
+        model_weights_id="rollout",
+    )
+
+    demo_batch = convert_trajectories_to_batch([demo_trajectory])
+    rollout_batch = convert_trajectories_to_batch([rollout_real])
+
+    assert demo_batch["loss_mask"].shape == (2, 1, 1)
+    assert rollout_batch["loss_mask"].shape == (4, 1, 1)
+
+    combined = concat_batch(rollout_batch, demo_batch)
+    assert "loss_mask" in combined
+    # 4 (rollout) + 2 (demo) along dim=0, trailing dims preserved.
+    assert combined["loss_mask"].shape == (6, 1, 1)
+
+
+@pytest.mark.parametrize("num_action_chunks", [2, 5, 10])
+def test_lerobot_demo_loss_mask_matches_multi_chunk_rollout(num_action_chunks):
+    """T1-multi — Demo + multi-chunk rollout concat under CRIT-R2-1 fix.
+
+    Round 1 missed the multi-chunk path: the LeRobot mask was hardcoded
+    ``[T, 1, 1]`` while real chunked rollouts emit ``[T, B, num_chunks]``.
+    The R2 fix exposes ``num_action_chunks`` on the LeRobot conversion API
+    so the demo mask carries a matching trailing dim. This test fails if
+    the fix regresses.
+
+    Also asserts that every chunk position is True (per consensus: LeRobot
+    frames are 1-action-per-step; no chunk position is "padded") and that
+    the SAC ``chunk_sample_weights`` reduction yields all-ones — without
+    this, a future regression that emits the right shape but the wrong
+    value would zero every demo sample's loss and silently break training.
+    """
+    from rlinf.data.embodied_io_struct import (
+        Trajectory,
+        convert_trajectories_to_batch,
+    )
+    from rlinf.utils.nested_dict_process import concat_batch
+    from rlinf.workers.actor.sac_demo_buffer_utils import chunk_sample_weights
+
+    demo_frames = [
+        _frame_with_next(0),
+        _frame_with_next(1, done=True, terminated=True),
+    ]
+    demo_trajectory = lerobot_episode_to_trajectory(
+        demo_frames, num_action_chunks=num_action_chunks
+    )
+    assert demo_trajectory.loss_mask.shape == (2, 1, num_action_chunks)
+    assert demo_trajectory.loss_mask.all(), (
+        "Every chunk position in a LeRobot demo must be True; otherwise "
+        "chunk_sample_weights would zero the sample and the demo would "
+        "silently drop out of SAC training."
+    )
+
+    rollout = Trajectory(
+        max_episode_length=3,
+        actions=torch.zeros(3, 1, 1),
+        rewards=torch.zeros(3, 1, 1),
+        terminations=torch.zeros(3, 1, 1, dtype=torch.bool),
+        truncations=torch.zeros(3, 1, 1, dtype=torch.bool),
+        dones=torch.zeros(3, 1, 1, dtype=torch.bool),
+        loss_mask=torch.ones(3, 1, num_action_chunks, dtype=torch.bool),
+        intervene_flags=torch.zeros(3, 1, 1, dtype=torch.bool),
+        forward_inputs={},
+        curr_obs={"states": torch.zeros(3, 1, 2)},
+        next_obs={"states": torch.zeros(3, 1, 2)},
+        model_weights_id="rollout",
+    )
+
+    demo_batch = convert_trajectories_to_batch([demo_trajectory])
+    rollout_batch = convert_trajectories_to_batch([rollout])
+    combined = concat_batch(rollout_batch, demo_batch)
+    assert combined["loss_mask"].shape == (5, 1, num_action_chunks)
+    # Validate that the SAC consumer of loss_mask sees all-valid for the
+    # demo slice (last 2 rows in batch dim 0).
+    sample_weights = chunk_sample_weights(
+        {"loss_mask": combined["loss_mask"]}, torch.float32
+    )
+    assert sample_weights is not None
+    assert sample_weights[-2:].all(), (
+        "chunk_sample_weights must mark every demo sample as valid; a "
+        "shape-correct but value-wrong loss_mask would silently zero them."
+    )
+
+
+def test_lerobot_demo_loss_mask_fills_missing_in_rollout():
+    """CRIT-R2-3 — Demo `loss_mask` + rollout without `loss_mask` concats.
+
+    Old SAC checkpoints (and non-RealWorld rollouts in general) don't emit
+    ``loss_mask``. The Round 1 strict ``concat_batch`` would raise when a
+    LeRobot demo (always carries ``loss_mask``) was mixed with such a
+    rollout. The R2 fix auto-fills the missing side with all-True.
+    """
+    from rlinf.data.embodied_io_struct import (
+        Trajectory,
+        convert_trajectories_to_batch,
+    )
+    from rlinf.utils.nested_dict_process import concat_batch
+
+    demo_frames = [
+        _frame_with_next(0),
+        _frame_with_next(1, done=True, terminated=True),
+    ]
+    demo_trajectory = lerobot_episode_to_trajectory(demo_frames)
+    rollout_no_mask = Trajectory(
+        max_episode_length=3,
+        actions=torch.zeros(3, 1, 1),
+        rewards=torch.zeros(3, 1, 1),
+        terminations=torch.zeros(3, 1, 1, dtype=torch.bool),
+        truncations=torch.zeros(3, 1, 1, dtype=torch.bool),
+        dones=torch.zeros(3, 1, 1, dtype=torch.bool),
+        loss_mask=None,  # the legacy / non-RealWorld case
+        intervene_flags=torch.zeros(3, 1, 1, dtype=torch.bool),
+        forward_inputs={},
+        curr_obs={"states": torch.zeros(3, 1, 2)},
+        next_obs={"states": torch.zeros(3, 1, 2)},
+        model_weights_id="rollout-legacy",
+    )
+
+    demo_batch = convert_trajectories_to_batch([demo_trajectory])
+    rollout_batch = convert_trajectories_to_batch([rollout_no_mask])
+    assert "loss_mask" in demo_batch
+    assert "loss_mask" not in rollout_batch
+    combined = concat_batch(rollout_batch, demo_batch)
+    # The missing-rollout-side mask was auto-filled to all-True.
+    assert combined["loss_mask"].shape == (5, 1, 1)
+    assert combined["loss_mask"].all()
+
+
+def test_lerobot_episode_rejects_source_target_terminal_disagreement():
+    """MAJ-11 regression (A3 sidestepped this branch in Round 1).
+
+    If a LeRobot action source frame says ``done=True`` but the
+    observation-only target frame says ``done=False``, that's a contract
+    violation. The converter must raise instead of silently choosing one
+    side. This test fails if the rejection branch regresses.
+    """
+    bad_frames = [
+        _frame(0, done=False),
+        # Action frame at index 1 implies terminal; target frame
+        # explicitly contradicts via done=False.
+        _frame(1, done=True),
+        {
+            "episode_index": 0,
+            "frame_index": 2,
+            "state": np.array([2.0, 2.5], dtype=np.float32),
+            "done": np.array([False], dtype=bool),
+            "terminated": np.array([False], dtype=bool),
+        },
+    ]
+    with pytest.raises(ValueError, match="disagree on 'done'"):
+        lerobot_episode_to_trajectory(bad_frames)
+
+
+def _make_env_worker_for_chunk_test(*, ignore_terminations: bool):
+    """Helper: build an EnvWorker stub for T2 mid-chunk truncation tests."""
+    from rlinf.workers.env.env_worker import EnvWorker
+
+    worker = object.__new__(EnvWorker)
+    worker.cfg = OmegaConf.create(
+        {
+            "env": {
+                "train": {
+                    "env_type": "realworld",
+                    "auto_reset": False,
+                    "ignore_terminations": ignore_terminations,
+                }
+            },
+            "actor": {
+                "model": {
+                    "model_type": "dummy",
+                    "num_action_chunks": 4,
+                    "action_dim": 2,
+                }
+            },
+        }
+    )
+    worker.use_external_reward_model = False
+    worker._timer_metrics = {}
+    return worker
+
+
+def test_env_worker_mid_chunk_truncation_collects_episode_metrics_from_natural_substep():
+    """T2 — Mid-chunk truncation under ``auto_reset=False`` (CRIT-2).
+
+    Uses a fake env that ends an episode at substep 1 of a 4-substep chunk
+    without hand-crafting ``final_info`` on the padded tail substep. Before
+    the fix, the consumer only read ``infos_list[-1]["episode"]`` which is
+    empty on the padded tail, so ``success``/``return``/``episode_len`` were
+    silently dropped.
+    """
+    from rlinf.workers.env.env_worker import EnvWorker  # noqa: F401
+
+    chunk_size = 4
+
+    class _MidChunkEnv:
+        """Single env that terminates at substep index 1 (mid-chunk).
+
+        Substep 1's info carries the real ``episode`` metrics (as the
+        wrapper would emit on the actual terminal step).  Subsequent
+        padded substeps carry a bare ``_valid_step`` marker only — the
+        natural shape of ``auto_reset=False`` output.
+        """
+
+        def chunk_step(self, chunk_actions):
+            obs_list = [
+                {"state": torch.tensor([[float(i)]])} for i in range(chunk_size)
+            ]
+            rewards = torch.zeros(1, chunk_size)
+            # ignore_terminations=False path uses chunk_dones; True path uses
+            # chunk_truncations.  Mark both at substep 1 so the same fake
+            # works for both variants below.
+            terminations = torch.tensor(
+                [[False, True, False, False]], dtype=torch.bool
+            )
+            truncations = torch.tensor(
+                [[False, True, False, False]], dtype=torch.bool
+            )
+            infos_list = [
+                {"_valid_step": True},
+                {
+                    "episode": {
+                        "return": torch.tensor([5.5]),
+                        "episode_len": torch.tensor([2]),
+                        "success": torch.tensor([True]),
+                    },
+                    "_valid_step": True,
+                },
+                {"_valid_step": False},
+                {"_valid_step": False},
+            ]
+            return obs_list, rewards, terminations, truncations, infos_list
+
+    # --- ignore_terminations=False branch (uses chunk_dones) ---
+    worker = _make_env_worker_for_chunk_test(ignore_terminations=False)
+    worker.env_list = [_MidChunkEnv()]
+    _, env_info = worker.env_interact_step(
+        torch.zeros(1, chunk_size, 2), stage_id=0
+    )
+    assert "return" in env_info, (
+        "auto_reset=False mid-chunk terminations must surface episode "
+        "metrics from the substep where they happened, not the padded tail."
+    )
+    torch.testing.assert_close(env_info["return"], torch.tensor([5.5]))
+    torch.testing.assert_close(env_info["episode_len"], torch.tensor([2]))
+    torch.testing.assert_close(env_info["success"], torch.tensor([True]))
+
+    # --- ignore_terminations=True branch (uses chunk_truncations) ---
+    worker = _make_env_worker_for_chunk_test(ignore_terminations=True)
+    worker.env_list = [_MidChunkEnv()]
+    _, env_info = worker.env_interact_step(
+        torch.zeros(1, chunk_size, 2), stage_id=0
+    )
+    assert "return" in env_info
+    torch.testing.assert_close(env_info["return"], torch.tensor([5.5]))
+    torch.testing.assert_close(env_info["episode_len"], torch.tensor([2]))
+    torch.testing.assert_close(env_info["success"], torch.tensor([True]))
+
+
+def test_lerobot_cli_default_intervene_flags_are_persisted(tmp_path):
+    """T3 — ``--no-default-intervene`` CLI persists ``intervene_flags`` (MAJ-9 / CLI surface).
+
+    Convert a parquet with no ``intervene_flag`` column twice: once with
+    ``--no-default-intervene`` (all False expected) and once with
+    ``--default-intervene`` (all True expected).
+    """
+    pandas = pytest.importorskip("pandas")
+
+    def _build_parquet(target_root):
+        data_dir = target_root / "data" / "chunk-000"
+        data_dir.mkdir(parents=True)
+        frames = []
+        for idx in (0, 1):
+            frame = _frame_with_next(
+                idx, episode_index=0, done=(idx == 1), terminated=(idx == 1)
+            )
+            frame.pop("intervene_flag", None)
+            frames.append(frame)
+        pandas.DataFrame(frames).to_parquet(data_dir / "episode_000000.parquet")
+
+    def _run(dataset_path, save_path, extra_flag: str):
+        subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "rlinf.data.lerobot_replay_buffer",
+                "--dataset-path",
+                str(dataset_path),
+                "--save-path",
+                str(save_path),
+                extra_flag,
+            ],
+            check=True,
+        )
+
+    # --- --no-default-intervene → all False ---
+    no_default_root = tmp_path / "no_default"
+    no_default_root.mkdir()
+    _build_parquet(no_default_root)
+    no_default_save = tmp_path / "no_default_save"
+    _run(no_default_root, no_default_save, "--no-default-intervene")
+    buffer_no = _load_test_replay_buffer(no_default_save)
+    trajectory_no = buffer_no.load_trajectory(0, "lerobot")
+    assert trajectory_no.intervene_flags is not None
+    assert not trajectory_no.intervene_flags.any(), (
+        "--no-default-intervene must persist intervene_flag=False on frames "
+        f"that omit the column; got {trajectory_no.intervene_flags!r}."
+    )
+
+    # --- --default-intervene → all True ---
+    default_root = tmp_path / "default"
+    default_root.mkdir()
+    _build_parquet(default_root)
+    default_save = tmp_path / "default_save"
+    _run(default_root, default_save, "--default-intervene")
+    buffer_yes = _load_test_replay_buffer(default_save)
+    trajectory_yes = buffer_yes.load_trajectory(0, "lerobot")
+    assert trajectory_yes.intervene_flags is not None
+    assert trajectory_yes.intervene_flags.all(), (
+        "--default-intervene must persist intervene_flag=True on frames "
+        f"that omit the column; got {trajectory_yes.intervene_flags!r}."
+    )
+
+
+def test_lerobot_trajectory_roundtrip_preserves_per_field_values(tmp_path):
+    """T4 — Roundtrip at the value level (replay-buffer save/load).
+
+    Convert one episode, save via the buffer's checkpoint API, load it back,
+    and assert every per-field tensor is bit-exact equal to the source.  This
+    closes the gap that earlier tests only checked shapes/keys.
+    """
+    frames = [
+        _frame_with_next(0, reward=0.25, intervene=False),
+        _frame_with_next(
+            1, reward=0.75, done=True, terminated=True, intervene=True
+        ),
+    ]
+    source_trajectory = lerobot_episode_to_trajectory(frames)
+
+    save_path = tmp_path / "buffer"
+    write_lerobot_frames_to_replay_buffer(frames, str(save_path))
+
+    loaded_buffer = _load_test_replay_buffer(save_path)
+    loaded_trajectory = loaded_buffer.load_trajectory(0, "lerobot")
+
+    for field in (
+        "actions",
+        "rewards",
+        "dones",
+        "terminations",
+        "truncations",
+        "intervene_flags",
+        "loss_mask",
+    ):
+        src = getattr(source_trajectory, field)
+        dst = getattr(loaded_trajectory, field)
+        assert dst is not None, f"loaded trajectory missing field '{field}'"
+        torch.testing.assert_close(
+            src,
+            dst,
+            msg=f"value mismatch for field '{field}' after save/load roundtrip",
+        )
+
+    # Observation dicts are nested.
+    for obs_name in ("curr_obs", "next_obs"):
+        src_obs = getattr(source_trajectory, obs_name)
+        dst_obs = getattr(loaded_trajectory, obs_name)
+        assert dst_obs is not None
+        assert set(src_obs.keys()) == set(dst_obs.keys())
+        for key in src_obs:
+            torch.testing.assert_close(
+                src_obs[key],
+                dst_obs[key],
+                msg=(
+                    f"value mismatch for {obs_name}['{key}'] after save/load "
+                    "roundtrip"
+                ),
+            )
+
+
+def test_lerobot_multi_episode_per_parquet_splits_into_separate_trajectories(
+    tmp_path,
+):
+    """T5 — Multi-episode-per-parquet fixture.
+
+    One parquet file contains rows for two different ``episode_index`` values;
+    ``convert_lerobot_frames_to_trajectories`` must produce two trajectories
+    with the per-episode actions / rewards intact (MAJ-9 grouping).
+    """
+    pandas = pytest.importorskip("pandas")
+    data_dir = tmp_path / "data" / "chunk-000"
+    data_dir.mkdir(parents=True)
+    rows = [
+        _frame_with_next(0, episode_index=0, reward=0.1),
+        _frame_with_next(
+            1, episode_index=0, reward=0.2, done=True, terminated=True
+        ),
+        _frame_with_next(0, episode_index=1, reward=0.3),
+        _frame_with_next(
+            1, episode_index=1, reward=0.4, done=True, terminated=True
+        ),
+    ]
+    pandas.DataFrame(rows).to_parquet(data_dir / "episode_000000.parquet")
+
+    frames = load_lerobot_parquet_frames(str(tmp_path))
+    trajectories = convert_lerobot_frames_to_trajectories(frames)
+
+    assert len(trajectories) == 2, (
+        f"expected 2 trajectories (one per episode_index); got "
+        f"{len(trajectories)}."
+    )
+
+    # Episodes preserve their own action / reward stream.
+    torch.testing.assert_close(
+        trajectories[0].rewards[:, 0, 0],
+        torch.tensor([0.1, 0.2]),
+    )
+    torch.testing.assert_close(
+        trajectories[1].rewards[:, 0, 0],
+        torch.tensor([0.3, 0.4]),
+    )
+    torch.testing.assert_close(
+        trajectories[0].actions[:, 0, 0],
+        torch.tensor([10.0, 11.0]),
+    )
+    torch.testing.assert_close(
+        trajectories[1].actions[:, 0, 0],
+        torch.tensor([10.0, 11.0]),
+    )
+
+
+def test_lerobot_optional_image_null_accepts_nan_and_pandas_na():
+    """T6 — Optional image cell ``np.nan`` and ``pandas.NA`` are treated as missing.
+
+    ``_is_missing_value`` was previously hard-coded to recognise only
+    ``None``; the F1 fix added length-1 NaN tensor/array handling.  This test
+    asserts the same handling for the ``np.nan`` scalar and the pandas
+    ``pd.NA`` sentinel commonly produced by parquet readers for optional
+    image columns.
+    """
+    pd = pytest.importorskip("pandas")
+
+    for missing_value in (np.nan, pd.NA):
+        frames = [_frame_with_next(0, done=True, terminated=True)]
+        # Set the optional wrist_image column to the missing sentinel.  The
+        # trajectory should not raise — it should be treated as if the key
+        # were absent.
+        frames[0]["wrist_image"] = missing_value
+        frames[0]["next_wrist_image"] = missing_value
+        frames[0]["extra_view_image"] = missing_value
+        frames[0]["next_extra_view_image"] = missing_value
+
+        trajectory = lerobot_episode_to_trajectory(frames)
+        assert "wrist_images" not in trajectory.curr_obs, (
+            f"missing sentinel {type(missing_value).__name__!s} must not "
+            "produce a wrist_images entry."
+        )
+        assert "extra_view_images" not in trajectory.curr_obs
+
+
+@pytest.mark.parametrize(
+    "field_name, bad_value",
+    [
+        # Multi-element NaN/Inf in state — caught by `_check_finite_nonempty`.
+        ("state", np.array([np.nan, 0.5], dtype=np.float32)),
+        ("state", np.array([np.inf, 0.5], dtype=np.float32)),
+        # 2-element NaN/Inf actions — caught by `_check_finite_nonempty`.
+        # (A length-1 NaN is deliberately treated as missing per MAJ-1, so
+        # we test multi-element here to hit the finite check.)
+        ("actions", np.array([np.nan, 0.0], dtype=np.float32)),
+        ("actions", np.array([np.inf, 0.0], dtype=np.float32)),
+        # Rewards must be scalar; length-1 Inf hits the finite check.
+        # (A length-1 NaN is treated as missing per MAJ-1, so reward
+        # falls back to the legacy success-based path — covered by the
+        # separate `terminal_reward` NaN test below.)
+        ("rewards", np.array([np.inf], dtype=np.float32)),
+        ("rewards", np.array([-np.inf], dtype=np.float32)),
+    ],
+)
+def test_lerobot_rejects_nan_inf_in_state_action_reward(field_name, bad_value):
+    """T7 — NaN/Inf rejection at state / action / reward (MAJ-2)."""
+    frames = [
+        _frame_with_next(0),
+        _frame_with_next(1, done=True, terminated=True),
+    ]
+    frames[0][field_name] = bad_value
+
+    with pytest.raises(ValueError, match="finite"):
+        lerobot_episode_to_trajectory(frames)
+
+
+def test_lerobot_terminal_reward_cli_rejects_nan_inf():
+    """T7 — CLI ``--terminal-reward`` rejects NaN/Inf at parse time (MAJ-2)."""
+    from rlinf.data.lerobot_replay_buffer import _finite_float
+
+    import argparse as _argparse
+
+    for bad in ("nan", "inf", "-inf", "Infinity"):
+        with pytest.raises(_argparse.ArgumentTypeError, match="finite"):
+            _finite_float(bad)
+
+    # Also at the convert API level.
+    frames = [
+        _frame_with_next(0),
+        _frame_with_next(1, done=True, terminated=True),
+    ]
+    with pytest.raises(ValueError, match="finite"):
+        lerobot_episode_to_trajectory(frames, terminal_reward=float("nan"))
+
+
+def test_lerobot_outside_path_containment_checked_before_decode(tmp_path):
+    """T8 — Path traversal rejected before reading file contents.
+
+    Uses a *valid* PNG OUTSIDE the dataset root (the existing test wrote
+    decoy bytes which would fail decode anyway, hiding whether the rejection
+    happened before or after the read). We monkey-patch ``Path.read_bytes``
+    to record any call, then assert the outside-PNG was never read.
+    """
+    dataset_root = tmp_path / "dataset"
+    dataset_root.mkdir()
+    outside_image = tmp_path / "outside.png"
+    outside_image.write_bytes(_png_bytes((33, 34, 35)))  # valid PNG
+
+    frames = [_frame_with_next(0, done=True, terminated=True)]
+    for frame in frames:
+        frame["_lerobot_dataset_root"] = str(dataset_root)
+        frame["image"] = {"path": "../outside.png"}
+        frame["next_image"] = np.zeros((2, 3, 3), dtype=np.uint8)
+
+    read_calls: list[str] = []
+    original_read_bytes = type(outside_image).read_bytes
+
+    def _spying_read_bytes(self):
+        read_calls.append(str(self))
+        return original_read_bytes(self)
+
+    from pathlib import Path as _Path
+
+    with patch.object(_Path, "read_bytes", _spying_read_bytes):
+        with pytest.raises(ValueError, match="escapes.*dataset root"):
+            lerobot_episode_to_trajectory(frames)
+
+    assert str(outside_image) not in read_calls, (
+        "Outside-root PNG bytes must not be read before containment is "
+        f"checked; observed reads: {read_calls!r}."
+    )
+
+
+def test_lerobot_dataset_writer_default_schema_omits_transition_fields():
+    """T9 — ``LeRobotDatasetWriter.create()`` default schema (MAJ-3).
+
+    With ``transition_schema=False`` (the new default) only the minimal set of
+    fields are exposed; with ``transition_schema=True`` the transition-rich
+    set (``next_state``, ``next_image``, ``terminated``, ``truncated``,
+    ``rewards``) appears.
+
+    We capture the ``features`` dict that ``create()`` would pass to the
+    upstream LeRobotDataset library by patching the import — this avoids
+    requiring lerobot to be installed in the unit-test environment.
+    """
+    from rlinf.data.lerobot_writer import LeRobotDatasetWriter
+
+    minimal_writer = LeRobotDatasetWriter()
+    rich_writer = LeRobotDatasetWriter()
+
+    captured: dict[str, dict] = {}
+
+    class _FakeLeRobotDataset:
+        @classmethod
+        def create(cls, *, repo_id, features, **_kwargs):
+            captured[repo_id] = features
+            return SimpleNamespace(image_writer=None, episode_buffer=None)
+
+    fake_module = SimpleNamespace(LeRobotDataset=_FakeLeRobotDataset)
+    fake_common = SimpleNamespace(datasets=SimpleNamespace(lerobot_dataset=fake_module))
+    fake_root = SimpleNamespace(common=fake_common)
+
+    with patch.dict(
+        sys.modules,
+        {
+            "lerobot": fake_root,
+            "lerobot.common": fake_common,
+            "lerobot.common.datasets": fake_common.datasets,
+            "lerobot.common.datasets.lerobot_dataset": fake_module,
+        },
+    ):
+        # T9 — call WITHOUT transition_schema so we exercise the actual
+        # default; if the default regressed to True the assertions below
+        # would fail.
+        minimal_writer.create(repo_id="minimal")
+        rich_writer.create(repo_id="rich", transition_schema=True)
+
+    minimal_features = captured["minimal"]
+    rich_features = captured["rich"]
+
+    transition_only_fields = {
+        "next_state",
+        "next_image",
+        "terminated",
+        "truncated",
+        "rewards",
+    }
+    minimal_expected = {
+        "state",
+        "actions",
+        "done",
+        "is_success",
+        "intervene_flag",
+        "image",
+    }
+
+    assert (
+        set(minimal_features.keys()) - transition_only_fields
+    ), "minimal schema is empty"
+    # MAJ-3: transition-rich fields must be ABSENT from the new default.
+    for field in transition_only_fields:
+        assert field not in minimal_features, (
+            f"Default (transition_schema=False) schema must not include "
+            f"'{field}'; this is the back-compat contract restored in MAJ-3."
+        )
+    assert minimal_expected.issubset(minimal_features.keys()), (
+        f"Default schema must keep the minimal set; missing="
+        f"{minimal_expected - set(minimal_features.keys())!r}."
+    )
+
+    # transition_schema=True must include the transition-rich keys.
+    for field in transition_only_fields:
+        assert field in rich_features, (
+            f"transition_schema=True must include '{field}' for the "
+            "replay-buffer roundtrip path."
+        )
+
+
+def test_sac_mask_integration_skips_optimizer_when_all_padded():
+    """T10 — SAC mask integration over forward_critic/actor/alpha (MAJ-4).
+
+    Drives ``apply_chunk_mask`` end-to-end through a deterministic per-sample
+    loss, then asserts the masked reduction excludes invalid (False) cells.
+    Also simulates the ``update_one_epoch`` skip-when-zero logic with mock
+    optimizers/schedulers to verify the all-zero-mask path is a true no-op.
+    """
+    from unittest.mock import MagicMock
+
+    from rlinf.workers.actor.sac_demo_buffer_utils import (
+        apply_chunk_mask,
+        chunk_sample_weights,
+    )
+
+    # ---- partial mask: last cell of the first chunk is invalid ----
+    # loss_mask shape [B=2, num_chunks=3]; chunk_sample_weights ANDs across the
+    # chunk dim, so any False there nukes the whole chunk's weight.
+    loss_mask = torch.tensor(
+        [[True, True, False], [True, True, True]], dtype=torch.bool
+    )
+    batch = {"loss_mask": loss_mask}
+    weights = chunk_sample_weights(batch, torch.float32)
+    torch.testing.assert_close(weights, torch.tensor([[0.0], [1.0]]))
+
+    # Deterministic per-sample loss = identity values; masked mean must equal
+    # the average over only the second (valid) chunk.
+    per_sample = torch.tensor([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]])
+    loss, valid_count = apply_chunk_mask(per_sample, weights)
+    # Only sample 1 contributes; feature average = (4+5+6) / 3 = 5.
+    torch.testing.assert_close(loss, torch.tensor(5.0))
+    assert valid_count == 1
+
+    # ---- all-zero mask: forward returns graph-connected zero, count==0 ----
+    # CRIT-R2-2 update: the all-zero loss MUST stay graph-connected so
+    # ``backward()`` can be safely called on every rank (FSDP backward is
+    # collective; rank-local skips deadlock peers). The skip-step
+    # semantics live in the worker via the global valid-count gate.
+    zero_weights = torch.zeros(2, 1)
+    per_sample_requires_grad = per_sample.clone().requires_grad_(True)
+    loss_zero, valid_count_zero = apply_chunk_mask(
+        per_sample_requires_grad, zero_weights
+    )
+    assert valid_count_zero == 0
+    assert loss_zero.item() == 0.0
+    assert loss_zero.requires_grad, (
+        "All-padded path must return a GRAPH-CONNECTED zero so every rank "
+        "can safely call backward() and FSDP collectives stay consistent."
+    )
+    # Backward on the graph-connected zero must succeed (no FSDP grad-fn
+    # error) and produce zero grads.
+    loss_zero.backward()
+    assert per_sample_requires_grad.grad is not None
+    assert torch.equal(
+        per_sample_requires_grad.grad, torch.zeros_like(per_sample_requires_grad)
+    )
+
+    # ---- skip-step semantics: simulate the MAJ-4 update_one_epoch contract ----
+    optimizer = MagicMock()
+    scheduler = MagicMock()
+    target_soft_update = MagicMock()
+
+    def _maybe_step(loss_tensor, valid_count_value):
+        """Mirrors the worker's `if valid_count > 0` guard."""
+        if valid_count_value > 0:
+            loss_tensor.backward() if loss_tensor.requires_grad else None
+            optimizer.step()
+            scheduler.step()
+            target_soft_update()
+
+    _maybe_step(loss_zero, valid_count_zero)
+    assert optimizer.step.call_count == 0, (
+        "All-zero mask must NOT advance optimizer.step()."
+    )
+    assert scheduler.step.call_count == 0, (
+        "All-zero mask must NOT advance scheduler.step() (LR schedule "
+        "advance was the most insidious failure in MAJ-4)."
+    )
+    assert target_soft_update.call_count == 0, (
+        "All-zero mask must NOT trigger the target soft-update."
+    )
+
+    # Sanity-check the converse: with a non-zero valid_count, step DOES run.
+    loss_valid = per_sample[1:].mean().clone().requires_grad_(True)
+    _maybe_step(loss_valid, 1)
+    assert optimizer.step.call_count == 1
+    assert scheduler.step.call_count == 1
+    assert target_soft_update.call_count == 1
+
+
+# =====================================================================
+# Round 3 regression tests: close the gaps Round 2 fixes added but
+# didn't otherwise cover.
+# =====================================================================
+
+
+def test_global_valid_count_falls_back_to_local_without_distributed():
+    """CRIT-R2-2 — ``_global_valid_count`` in single-process mode.
+
+    The FSDP-collective fix all-reduces the per-rank valid count before
+    gating optimizer/scheduler/all_reduce. In unit-test scope (no
+    ``torch.distributed`` init), it must fall back to the local value
+    so single-GPU training still works.
+    """
+    EmbodiedSACFSDPPolicy = pytest.importorskip(
+        "rlinf.workers.actor.fsdp_sac_policy_worker",
+        reason=(
+            "transformers / fsdp deps missing in this CI image; the fallback "
+            "logic itself is exercised by integration tests."
+        ),
+        exc_type=ImportError,
+    ).EmbodiedSACFSDPPolicy
+
+    worker = object.__new__(EmbodiedSACFSDPPolicy)
+    worker.device = torch.device("cpu")
+    # No torch.distributed init in unit tests.
+    assert worker._global_valid_count(0) == 0
+    assert worker._global_valid_count(7) == 7
+
+
+def test_env_worker_close_calls_close_on_every_env():
+    """CRIT-R2-NEW1 — ``EnvWorker._close`` drains every env wrapper.
+
+    Without this hook ``ray.kill`` tears the actor down before
+    ``CollectEpisode.close()`` finishes, dropping collected episodes.
+    """
+    from rlinf.workers.env.env_worker import EnvWorker
+
+    worker = object.__new__(EnvWorker)
+    closes = []
+
+    class _Env:
+        def __init__(self, name):
+            self.name = name
+
+        def close(self):
+            closes.append(self.name)
+
+    worker.env_list = [_Env("train_0"), _Env("train_1")]
+    worker.eval_env_list = [_Env("eval_0")]
+    worker._close()
+    assert closes == ["train_0", "train_1", "eval_0"]
+
+
+def test_env_worker_close_swallows_per_env_errors_but_raises_first():
+    """CRIT-R2-NEW1 — A single bad ``close()`` must not leak other envs."""
+    from rlinf.workers.env.env_worker import EnvWorker
+
+    worker = object.__new__(EnvWorker)
+    closes = []
+
+    class _Env:
+        def __init__(self, name, raises=False):
+            self.name = name
+            self.raises = raises
+
+        def close(self):
+            if self.raises:
+                raise RuntimeError(f"bad-close-{self.name}")
+            closes.append(self.name)
+
+    worker.env_list = [
+        _Env("train_0", raises=True),
+        _Env("train_1"),
+    ]
+    worker.eval_env_list = [_Env("eval_0", raises=True)]
+    with pytest.raises(RuntimeError, match="bad-close-train_0"):
+        worker._close()
+    # train_1 still got closed despite train_0's error.
+    assert "train_1" in closes
+
+
+def test_replay_buffer_close_propagates_async_save_error(tmp_path):
+    """CRIT-R2-NEW2 — ``close(wait=True)`` surfaces async-save failures.
+
+    Before the fix, ``_save_metadata`` / ``_save_trajectory_index`` errors
+    were caught inside the executor's submitted future but never observed
+    because ``close()`` shut the executor down without calling
+    ``.result()``. Caller saw a clean exit + incomplete checkpoint.
+    """
+    from rlinf.data.replay_buffer import TrajectoryReplayBuffer
+
+    save_path = tmp_path / "buffer"
+    save_path.mkdir()
+    buffer = TrajectoryReplayBuffer(
+        auto_save=True,
+        auto_save_path=str(save_path),
+        enable_cache=False,
+    )
+
+    boom = RuntimeError("simulated save failure")
+
+    def _failing_metadata(*_args, **_kwargs):
+        raise boom
+
+    # Force the next async metadata flush to fail.
+    buffer._save_metadata = _failing_metadata  # type: ignore[assignment]
+    fut = buffer._save_executor.submit(buffer._save_metadata)
+    with buffer._pending_save_lock:
+        buffer._pending_save_futures.append(fut)
+
+    with pytest.raises(RuntimeError, match="simulated save failure"):
+        buffer.close(wait=True)
+
+
+def test_replay_buffer_atomic_metadata_write_no_partial_file(tmp_path):
+    """CRIT-R2-11 — Metadata write must be atomic.
+
+    Simulate a write that fails AFTER the JSON dump but before
+    ``os.replace``: the target file must NOT exist (so a subsequent load
+    won't read a half-written checkpoint) and the temp file must be
+    cleaned up.
+    """
+    from rlinf.data.replay_buffer import TrajectoryReplayBuffer
+    import os as _os
+
+    target = tmp_path / "metadata.json"
+    original_replace = _os.replace
+
+    def _replace_fail(src, dst):
+        # Simulate disk-full / permission failure at the rename step.
+        raise OSError("simulated rename failure")
+
+    try:
+        _os.replace = _replace_fail
+        with pytest.raises(OSError, match="rename failure"):
+            TrajectoryReplayBuffer._atomic_write_json(
+                str(target), {"x": 1}
+            )
+    finally:
+        _os.replace = original_replace
+
+    assert not target.exists(), (
+        "atomic write must leave no half-written target on rename failure"
+    )
+    # No leftover temp file in the dir.
+    temp_files = [p for p in tmp_path.iterdir() if p.name.startswith(".tmp-")]
+    assert temp_files == [], (
+        f"atomic write leaked temp file(s): {temp_files}"
+    )
+
+
+def test_lerobot_cli_num_action_chunks_propagates_to_loss_mask(tmp_path):
+    """CRIT-R2-1 / R3-CLI — ``--num-action-chunks`` actually wires through.
+
+    Round 2 added the kwarg, but if ``_parse_args`` or ``main()`` dropped
+    ``args.num_action_chunks`` the new tests would still pass because they
+    call the Python API directly. This test runs the CLI and inspects the
+    persisted ``loss_mask`` trailing dim to prove the wiring is intact.
+    """
+    import subprocess
+    import sys
+
+    pandas = pytest.importorskip("pandas")
+    dataset_root = tmp_path / "ds" / "rank_0" / "id_0"
+    (dataset_root / "data").mkdir(parents=True)
+    df = pandas.DataFrame(
+        [
+            _frame_with_next(0),
+            _frame_with_next(1, done=True, terminated=True),
+        ]
+    )
+    df.to_parquet(dataset_root / "data" / "episode_000000.parquet")
+
+    save_path = tmp_path / "buffer"
+    cmd = [
+        sys.executable,
+        "-m",
+        "rlinf.data.lerobot_replay_buffer",
+        "--dataset-path",
+        str(tmp_path / "ds"),
+        "--save-path",
+        str(save_path),
+        "--num-action-chunks",
+        "7",
+        "--state-only",
+    ]
+    env = {
+        **os.environ,
+        "PYTHONPATH": "/home/kunni/plusai_ws/RLinf",
+    }
+    result = subprocess.run(cmd, capture_output=True, text=True, env=env)
+    assert result.returncode == 0, f"CLI failed: {result.stderr}"
+
+    buf = _load_test_replay_buffer(save_path)
+    buf.load_checkpoint(str(save_path))
+    [traj_id] = buf.list_trajectory_ids()
+    info = buf.get_trajectory_info(traj_id)
+    trajectory = buf.load_trajectory(traj_id, info["model_weights_id"])
+    assert trajectory.loss_mask is not None
+    # The CLI's ``--num-action-chunks 7`` MUST flow through to the persisted
+    # trajectory's ``loss_mask`` trailing dim.
+    assert trajectory.loss_mask.shape[-1] == 7
+    buf.close()
+
+
+def test_concat_batch_loss_mask_fillable_batch_dim_correct():
+    """CRIT-R2-3 — auto-fill of missing ``loss_mask`` uses peer batch dim.
+
+    A subtle bug in the first iteration of the fillable-default code
+    duplicated the OTHER side's tensor shape, producing an incorrect
+    summed batch dim. The fix derives the fill's leading dim from any
+    peer tensor on the side that lacks the key.
+    """
+    from rlinf.utils.nested_dict_process import concat_batch
+
+    rollout = {"actions": torch.zeros(3, 1, 1)}
+    demo = {
+        "actions": torch.zeros(2, 1, 1),
+        "loss_mask": torch.ones(2, 1, 1, dtype=torch.bool),
+    }
+    combined = concat_batch(rollout, demo)
+    assert combined["actions"].shape == (5, 1, 1)
+    # The rollout side had no loss_mask; the fill must match rollout's
+    # batch dim (3), then cat with demo's loss_mask (2) → (5, 1, 1).
+    assert combined["loss_mask"].shape == (5, 1, 1)
+    assert combined["loss_mask"].all()
+
+
+# =====================================================================
+# Round 4 regression tests
+# =====================================================================
+
+
+def test_apply_chunk_mask_zero_path_sanitizes_nan_loss():
+    """CRIT-R4-1 — the graph-connected zero must NOT propagate NaN.
+
+    Before R4 the all-zero-mask path computed ``(per_sample_loss * 0.0).sum()``.
+    If ``per_sample_loss`` had any NaN/Inf, ``NaN * 0.0 = NaN`` → FSDP
+    backward writes NaN grads → clip_grad_norm all_reduces NaN → entire
+    model corrupted across the DP group. The R4 fix sanitizes the loss
+    before the multiply.
+    """
+    from rlinf.workers.actor.sac_demo_buffer_utils import apply_chunk_mask
+
+    # Loss has NaN/Inf on what would have been masked positions.
+    per_sample = torch.tensor(
+        [[float("nan"), 1.0], [float("inf"), 2.0]], requires_grad=True
+    )
+    zero_weights = torch.zeros(2, 1)
+    loss, valid_count = apply_chunk_mask(per_sample, zero_weights)
+    assert valid_count == 0
+    assert torch.isfinite(loss), (
+        "All-zero path must NOT propagate NaN/Inf from masked positions; "
+        "otherwise FSDP backward poisons every rank's grads."
+    )
+    # backward() must work and produce finite (zero) grads.
+    loss.backward()
+    assert per_sample.grad is not None
+    assert torch.isfinite(per_sample.grad).all()
+
+
+def test_apply_chunk_mask_partial_path_sanitizes_nan_in_masked_positions():
+    """CRIT-R4-1 — partial-mask path must also strip NaN/Inf at masked-out cells.
+
+    A NaN/Inf at a position the mask zeros out would still propagate
+    through the ``per_sample_loss * weights`` multiply, because
+    ``NaN * 0.0 == NaN``.
+    """
+    from rlinf.workers.actor.sac_demo_buffer_utils import apply_chunk_mask
+
+    # Sample 0 is invalid (weight 0) but its loss is NaN. Sample 1 is valid.
+    per_sample = torch.tensor(
+        [[float("nan"), float("inf")], [3.0, 4.0]], requires_grad=True
+    )
+    weights = torch.tensor([[0.0], [1.0]])
+    loss, valid_count = apply_chunk_mask(per_sample, weights)
+    assert valid_count == 1
+    assert torch.isfinite(loss), (
+        "The masked-out NaN must NOT poison the valid-sample reduction."
+    )
+    # The valid sample's average loss is (3+4)/2 = 3.5.
+    torch.testing.assert_close(loss, torch.tensor(3.5))
+
+
+def test_concat_batch_strict_rejects_curr_obs_only_in_one_side():
+    """CRIT-R4-5 — strict mode catches dict-key drift on uniform-required dicts.
+
+    ``forward_inputs`` is opt-in (lenient), but ``curr_obs`` / ``next_obs``
+    must be uniform; silent drop would corrupt observation schemas.
+    """
+    from rlinf.utils.nested_dict_process import concat_batch
+
+    rollout = {
+        "actions": torch.zeros(2, 1, 1),
+        "curr_obs": {"states": torch.zeros(2, 1, 4)},
+    }
+    demo = {
+        "actions": torch.zeros(3, 1, 1),
+        # Missing curr_obs entirely — must be rejected under strict mode.
+    }
+    with pytest.raises(ValueError, match="dict keys only in data1"):
+        concat_batch(rollout, demo)
+
+
+def test_concat_batch_strict_allows_forward_inputs_asymmetry():
+    """CRIT-R4-5 — opt-in dicts (``forward_inputs``) keep working when
+    only one side carries them.
+
+    The lenient list (``_CONCAT_BATCH_LENIENT_DICT_KEYS``) must remain in
+    effect: production rollouts often have an empty ``forward_inputs``
+    while LeRobot demos always populate it.
+    """
+    from rlinf.utils.nested_dict_process import concat_batch
+
+    rollout = {"actions": torch.zeros(2, 1, 1)}
+    demo = {
+        "actions": torch.zeros(3, 1, 1),
+        "forward_inputs": {"action": torch.zeros(3, 1, 1)},
+    }
+    # Must not raise; concat the actions; forward_inputs is opt-in.
+    combined = concat_batch(rollout, demo)
+    assert combined["actions"].shape == (5, 1, 1)
+
+
+def test_unknown_camera_keys_routes_slash_form_front_wrist():
+    """CRIT-R4-6 — slash-form camera keys must actually be routed.
+
+    Before R4, ``observation/images/front`` passed the unknown-key guard
+    (matching prefix + camera name "front") but the routed key tuple only
+    contained the dot-form, so the data was silently dropped.
+    """
+    from rlinf.data.lerobot_replay_buffer import (
+        _MAIN_IMAGE_KEYS,
+        _NEXT_MAIN_IMAGE_KEYS,
+        _WRIST_IMAGE_KEYS,
+        _NEXT_WRIST_IMAGE_KEYS,
+    )
+
+    assert "observation/images/front" in _MAIN_IMAGE_KEYS
+    assert "next_observation/images/front" in _NEXT_MAIN_IMAGE_KEYS
+    assert "observation/images/wrist" in _WRIST_IMAGE_KEYS
+    assert "next_observation/images/wrist" in _NEXT_WRIST_IMAGE_KEYS
+
+
+def test_replay_buffer_clear_resets_durable_trajectory_ids(tmp_path):
+    """CRIT-R4-4 — ``clear()`` must reset ``_durable_trajectory_ids``.
+
+    Without this, the next ``_save_metadata`` writes a non-zero ``size``
+    (durable set inflated by stale IDs) while ``_save_trajectory_index``
+    writes an empty index → metadata says "1 trajectory" but the index
+    has none.
+    """
+    from rlinf.data.replay_buffer import TrajectoryReplayBuffer
+
+    save_path = tmp_path / "buf"
+    save_path.mkdir()
+    buffer = TrajectoryReplayBuffer(
+        auto_save=True,
+        auto_save_path=str(save_path),
+        enable_cache=False,
+    )
+    # Simulate a successful save that promoted the id to durable.
+    buffer._durable_trajectory_ids.add(0)
+    assert buffer._durable_trajectory_ids == {0}
+    buffer.clear()
+    assert buffer._durable_trajectory_ids == set(), (
+        "clear() must reset the durable id set or persisted size will "
+        "disagree with persisted index."
+    )
+    buffer.close()
+
+
+def test_replay_buffer_is_ready_excludes_pending_in_flight_trajectories(
+    tmp_path, monkeypatch
+):
+    """CRIT-R4-3 — ``is_ready`` must not count trajectories whose save is
+    still in flight.
+
+    Before R4, ``size`` counted them — ``sample_chunks`` could then pick
+    one and ``_load_trajectory`` would FileNotFoundError on the missing
+    payload.
+    """
+    from rlinf.data.replay_buffer import TrajectoryReplayBuffer
+
+    save_path = tmp_path / "buf"
+    save_path.mkdir()
+    buffer = TrajectoryReplayBuffer(
+        auto_save=True,
+        auto_save_path=str(save_path),
+        enable_cache=False,
+    )
+
+    # Pretend `add_trajectories` registered an in-flight id WITHOUT
+    # promoting it to durable yet.
+    with buffer._index_lock:
+        buffer._trajectory_index[0] = {
+            "num_samples": 4,
+            "trajectory_id": 0,
+            "max_episode_length": 4,
+            "shape": (4, 1, 1),
+            "model_weights_id": "test",
+        }
+        buffer._trajectory_id_list.append(0)
+        buffer.size = 1
+        buffer._total_samples = 4
+        # `_durable_trajectory_ids` remains empty — file not yet on disk.
+
+    assert not buffer.is_ready(1), (
+        "is_ready must filter to durable trajectories under auto_save; "
+        "otherwise sample_chunks crashes on the missing file."
+    )
+
+    # Once durable, is_ready becomes true.
+    with buffer._index_lock:
+        buffer._durable_trajectory_ids.add(0)
+    assert buffer.is_ready(1)
+
+    buffer.close()
+
+
+def test_replay_buffer_sample_chunks_excludes_pending_in_flight(tmp_path):
+    """CRIT-R5-1 — ``sample_chunks`` must also filter against durable IDs.
+
+    Before R5, only ``is_ready`` consulted the durable set; ``sample_chunks``
+    walked ``_trajectory_id_list`` directly, so a pending in-flight id
+    could be sampled and ``_load_trajectory`` would crash with
+    ``FileNotFoundError`` on the missing payload file.
+    """
+    from rlinf.data.replay_buffer import TrajectoryReplayBuffer
+
+    save_path = tmp_path / "buf"
+    save_path.mkdir()
+    buffer = TrajectoryReplayBuffer(
+        auto_save=True,
+        auto_save_path=str(save_path),
+        sample_window_size=0,  # include all eligible
+        enable_cache=False,
+    )
+
+    # Register one in-flight id (no payload yet) AND one durable id (with
+    # payload written). sample_chunks must only see the durable one.
+    with buffer._index_lock:
+        for tid, durable in [(0, False), (1, True)]:
+            buffer._trajectory_index[tid] = {
+                "num_samples": 4,
+                "trajectory_id": tid,
+                "max_episode_length": 4,
+                "shape": (4, 1, 1),
+                "model_weights_id": "test",
+            }
+            buffer._trajectory_id_list.append(tid)
+            buffer._trajectory_file_path[tid] = str(save_path)
+            if durable:
+                buffer._durable_trajectory_ids.add(tid)
+        buffer.size = 2
+        buffer._total_samples = 8
+
+    # Write the payload for id=1 only so ``_load_trajectory`` would succeed.
+    minimal_traj = SimpleNamespace(
+        max_episode_length=4,
+        model_weights_id="test",
+    )
+    # Use the real save path so the file matches what _load_trajectory
+    # expects; only id=1 has a file on disk.
+    from rlinf.data.embodied_io_struct import Trajectory
+
+    real_traj = Trajectory(
+        max_episode_length=4,
+        model_weights_id="test",
+        actions=torch.zeros(4, 1, 1),
+        rewards=torch.zeros(4, 1, 1),
+        terminations=torch.zeros(4, 1, 1, dtype=torch.bool),
+        truncations=torch.zeros(4, 1, 1, dtype=torch.bool),
+        dones=torch.zeros(4, 1, 1, dtype=torch.bool),
+        intervene_flags=torch.zeros(4, 1, 1, dtype=torch.bool),
+        forward_inputs={},
+        curr_obs={"states": torch.zeros(4, 1, 2)},
+        next_obs={"states": torch.zeros(4, 1, 2)},
+    )
+    buffer._save_trajectory(real_traj, 1, "test")
+
+    # Repeated sampling must NEVER hit the missing pending id (file for
+    # id=0 does not exist on disk).
+    for _ in range(20):
+        batch = buffer.sample_chunks(2)
+        # Sampling must succeed (no FileNotFoundError).
+        assert "actions" in batch
+
+    buffer.close()
+
+
+def test_update_one_epoch_skips_optim_and_scheduler_under_all_padded_global():
+    """T10 (real-code variant) — ``update_one_epoch`` must NOT advance
+    the optimizer / LR scheduler / soft target when GLOBALLY zero valid
+    samples.
+
+    The Round 4 ``T10`` covered only the helper-level guard via
+    MagicMocks; this version instantiates ``EmbodiedSACFSDPPolicy`` via
+    ``object.__new__`` and monkey-patches the forward functions +
+    optimizers so we exercise the actual gating path in
+    ``update_one_epoch``. A regression that ignored
+    ``_global_valid_count`` and advanced LR/target on the all-padded
+    global batch would now fail this test.
+    """
+    fsdp_mod = pytest.importorskip(
+        "rlinf.workers.actor.fsdp_sac_policy_worker",
+        reason="transformers / fsdp deps missing in this CI image",
+        exc_type=ImportError,
+    )
+    EmbodiedSACFSDPPolicy = fsdp_mod.EmbodiedSACFSDPPolicy
+    from unittest.mock import MagicMock
+
+    worker = object.__new__(EmbodiedSACFSDPPolicy)
+    worker.device = torch.device("cpu")
+    worker.cfg = OmegaConf.create(
+        {
+            "actor": {
+                "critic_optim": {"clip_grad": 1.0},
+                "optim": {"clip_grad": 1.0},
+            },
+            "algorithm": {
+                "entropy_tuning": {"optim": {"clip_grad": 1.0}},
+                "target_update_freq": 1,
+            },
+        }
+    )
+    worker.gradient_accumulation = 1
+    worker.critic_actor_ratio = 1
+    worker.update_step = 0
+    worker.enable_drq = False
+    worker.use_dsrl = False
+    worker.target_model_initialized = True
+
+    # Spy optimizers/schedulers/target updater.
+    worker.qf_optimizer = MagicMock()
+    worker.qf_lr_scheduler = MagicMock()
+    worker.optimizer = MagicMock()
+    worker.lr_scheduler = MagicMock()
+    worker.alpha_optimizer = None  # disabled for this test
+    worker.entropy_temp = MagicMock()
+    worker.entropy_temp.alpha = 0.1
+    worker.model = MagicMock()
+    worker.model.clip_grad_norm_ = MagicMock(return_value=0.0)
+    worker.soft_update_target_model = MagicMock()
+
+    # Forward functions return a graph-connected ZERO loss (no valid samples).
+    sentinel = torch.zeros((), requires_grad=True)
+
+    def fake_forward_critic(_batch):
+        return (sentinel * 0.0).sum(), 0, {}
+
+    def fake_forward_actor(_batch):
+        return (sentinel * 0.0).sum(), torch.tensor(0.0), 0, {}
+
+    worker.forward_critic = fake_forward_critic
+    worker.forward_actor = fake_forward_actor
+
+    # Dataloader hands the worker a one-microbatch list (we bypass via
+    # `train_micro_batch_list` injection).
+    worker.buffer_dataloader_iter = iter(
+        [
+            {
+                "loss_mask": torch.zeros(1, 1, dtype=torch.bool),
+                "curr_obs": {"states": torch.zeros(1, 1, 2)},
+                "next_obs": {"states": torch.zeros(1, 1, 2)},
+                "actions": torch.zeros(1, 1, 1),
+            }
+        ]
+    )
+
+    # Pretend global_batch_size==micro_batch_size==1 so the split helper
+    # returns a one-element list (no FSDP split bookkeeping).
+    worker.cfg.actor.global_batch_size = 1
+    worker.cfg.actor.micro_batch_size = 1
+    worker._world_size = 1
+
+    # Force _global_valid_count to return 0 to simulate global-padded.
+    worker._global_valid_count = MagicMock(return_value=0)
+
+    # Patch DRQ + worker_timer + put_tensor_device + split_dict_to_chunk
+    # to be inert.
+    worker.worker_timer = MagicMock()
+    worker.worker_timer.return_value.__enter__ = MagicMock()
+    worker.worker_timer.return_value.__exit__ = MagicMock(return_value=False)
+
+    # Run one epoch. Must not raise; must not step.
+    metrics_data = EmbodiedSACFSDPPolicy.update_one_epoch(worker, train_actor=True)
+
+    assert worker.qf_optimizer.step.call_count == 0, (
+        "qf_optimizer.step MUST NOT advance under all-padded global batch."
+    )
+    assert worker.qf_lr_scheduler.step.call_count == 0, (
+        "qf_lr_scheduler.step MUST NOT advance — that was the MAJ-4 bug."
+    )
+    assert worker.optimizer.step.call_count == 0
+    assert worker.lr_scheduler.step.call_count == 0
+    assert worker.soft_update_target_model.call_count == 0, (
+        "Target soft-update MUST be skipped on all-padded global batch."
+    )
+    # Reported critic_valid_count must reflect the global zero.
+    assert int(metrics_data.get("critic/valid_count", -1)) == 0
+
+
+def test_apply_chunk_mask_zero_path_still_works_without_distributed():
+    """CRIT-R7 — apply_chunk_mask must not deadlock when valid==0.
+
+    Round 7's fix moved the all-reduce of ``valid_count`` to BEFORE the
+    early return for the all-padded case, so every rank participates in
+    the collective regardless of local validity. In single-process mode
+    the all-reduce is skipped; the zero path still returns a finite
+    graph-connected zero.
+    """
+    from rlinf.workers.actor.sac_demo_buffer_utils import apply_chunk_mask
+
+    per_sample = torch.tensor([[1.0, 2.0]], requires_grad=True)
+    zero_weights = torch.zeros(1, 1)
+    loss, valid = apply_chunk_mask(per_sample, zero_weights)
+    assert valid == 0
+    assert torch.isfinite(loss) and loss.item() == 0.0
+    # Backward must succeed (no FSDP grad-fn error) and produce zeros.
+    loss.backward()
+    assert torch.isfinite(per_sample.grad).all()
+    assert per_sample.grad.abs().sum().item() == 0.0
+
+
+def test_replay_buffer_rejects_add_after_close(tmp_path):
+    """CRIT-R8 — ``add_trajectories`` after ``close()`` must raise.
+
+    Otherwise the close-first race window (close drains empty pending,
+    then add submits a future close cannot await → executor.shutdown
+    swallows the error) silently loses persistence failures.
+    """
+    from rlinf.data.replay_buffer import TrajectoryReplayBuffer
+    from rlinf.data.embodied_io_struct import Trajectory
+
+    save_path = tmp_path / "buf"
+    save_path.mkdir()
+    buffer = TrajectoryReplayBuffer(
+        auto_save=True,
+        auto_save_path=str(save_path),
+        enable_cache=False,
+    )
+    buffer.close(wait=True)
+
+    traj = Trajectory(
+        max_episode_length=2,
+        model_weights_id="test",
+        actions=torch.zeros(2, 1, 1),
+        rewards=torch.zeros(2, 1, 1),
+        terminations=torch.zeros(2, 1, 1, dtype=torch.bool),
+        truncations=torch.zeros(2, 1, 1, dtype=torch.bool),
+        dones=torch.zeros(2, 1, 1, dtype=torch.bool),
+        intervene_flags=torch.zeros(2, 1, 1, dtype=torch.bool),
+        forward_inputs={},
+        curr_obs={"states": torch.zeros(2, 1, 2)},
+        next_obs={"states": torch.zeros(2, 1, 2)},
+    )
+    with pytest.raises(RuntimeError, match="already been closed"):
+        buffer.add_trajectories([traj])
+
+
+def test_iter_trajectory_metadata_skips_pending_in_flight(tmp_path):
+    """CRIT-R7 — iter_trajectory_metadata + list_trajectory_ids must
+    not yield in-flight ids whose payload is not durable.
+
+    Otherwise external consumers (visualizer, validator) that call
+    ``load_trajectory(id, mwid)`` immediately after iterating would
+    crash with FileNotFoundError on the pending payload file.
+    """
+    from rlinf.data.replay_buffer import TrajectoryReplayBuffer
+
+    save_path = tmp_path / "buf"
+    save_path.mkdir()
+    buffer = TrajectoryReplayBuffer(
+        auto_save=True,
+        auto_save_path=str(save_path),
+        enable_cache=False,
+    )
+
+    with buffer._index_lock:
+        for tid in (0, 1):
+            buffer._trajectory_index[tid] = {
+                "num_samples": 4,
+                "trajectory_id": tid,
+                "max_episode_length": 4,
+                "shape": (4, 1, 1),
+                "model_weights_id": "test",
+            }
+            buffer._trajectory_id_list.append(tid)
+        # Only tid=1 is durable; tid=0 is still in flight.
+        buffer._durable_trajectory_ids.add(1)
+        buffer.size = 2
+
+    ids = buffer.list_trajectory_ids()
+    metadata = list(buffer.iter_trajectory_metadata())
+    assert ids == [1], (
+        f"list_trajectory_ids must filter pending; got {ids}."
+    )
+    assert [m[0] for m in metadata] == [1], (
+        f"iter_trajectory_metadata must filter pending; got {metadata}."
+    )
+
+    buffer.close()
+
+
+def test_loaded_demo_buffer_rejects_loss_mask_chunk_mismatch():
+    """CRIT-R5-3 — demo validator must catch num_action_chunks drift.
+
+    A demo buffer converted with ``--num-action-chunks=1`` for a training
+    config that uses ``num_action_chunks=5`` would pass the old validator
+    and crash at the first ``concat_batch`` with a cryptic shape error.
+    The R5 fix rejects the mismatch at load time with an actionable
+    message.
+    """
+    from rlinf.workers.actor.sac_demo_buffer_utils import (
+        _validate_required_trajectory_fields,
+    )
+
+    trajectory = SimpleNamespace(
+        actions=torch.zeros(4, 1, 7),  # 7-dim action_dim
+        rewards=torch.zeros(4, 1, 1),
+        terminations=torch.zeros(4, 1, 1, dtype=torch.bool),
+        truncations=torch.zeros(4, 1, 1, dtype=torch.bool),
+        dones=torch.zeros(4, 1, 1, dtype=torch.bool),
+        # loss_mask carries the WRONG trailing dim (1 instead of expected 5).
+        loss_mask=torch.ones(4, 1, 1, dtype=torch.bool),
+    )
+    model_cfg = OmegaConf.create(
+        {"model_type": "mlp_policy", "action_dim": 7, "num_action_chunks": 5}
+    )
+    with pytest.raises(ValueError, match="num_action_chunks"):
+        _validate_required_trajectory_fields(
+            trajectory,
+            load_path="x",
+            rank=0,
+            trajectory_id=0,
+            model_cfg=model_cfg,
+        )

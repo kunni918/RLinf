@@ -73,6 +73,10 @@ class MultiTrajectoryVisualizer:
         self.step_idx = 0
         self.batch_idx = 0
 
+        # Snapshot the trajectory id list via the public API so we don't bind
+        # to ``_trajectory_id_list`` / ``_trajectory_index`` private attributes.
+        self._trajectory_ids = self.buffer.list_trajectory_ids()
+
         self.current_trajectory = None
         self.current_traj_id = None
         self.current_traj_shape = None
@@ -89,7 +93,8 @@ class MultiTrajectoryVisualizer:
         print(f"Total samples: {self.buffer.total_samples}")
         print(f"Camera view: {camera_key}")
         print(
-            f"Trajectory IDs: {self.buffer._trajectory_id_list[:10]}{'...' if self.buffer.size > 10 else ''}"
+            f"Trajectory IDs: {self._trajectory_ids[:10]}"
+            f"{'...' if len(self._trajectory_ids) > 10 else ''}"
         )
 
         if self.save_image:
@@ -101,11 +106,11 @@ class MultiTrajectoryVisualizer:
 
     def _load_current_trajectory(self):
         """Lazily load the current trajectory from disk."""
-        traj_id = self.buffer._trajectory_id_list[self.traj_idx]
-        traj_info = self.buffer._trajectory_index[traj_id]
+        traj_id = self._trajectory_ids[self.traj_idx]
+        traj_info = self.buffer.get_trajectory_info(traj_id)
         model_weights_id = traj_info["model_weights_id"]
 
-        self.current_trajectory = self.buffer._load_trajectory(
+        self.current_trajectory = self.buffer.load_trajectory(
             traj_id, model_weights_id
         )
         self.current_traj_id = traj_id
@@ -160,12 +165,12 @@ class MultiTrajectoryVisualizer:
 
         if self.step_idx < max_step:
             self.step_idx += 1
-        elif self.traj_idx < self.buffer.size - 1:
+        elif self.traj_idx < len(self._trajectory_ids) - 1:
             self.traj_idx += 1
             self.step_idx = 0
             self.batch_idx = 0
             self._load_current_trajectory()
-            next_traj_id = self.buffer._trajectory_id_list[self.traj_idx]
+            next_traj_id = self._trajectory_ids[self.traj_idx]
             print(f"→ Auto-switched to trajectory {next_traj_id}")
 
     def _prev_step(self):
@@ -178,17 +183,17 @@ class MultiTrajectoryVisualizer:
             self.step_idx = self._get_max_step_idx()
             T, B = self.current_traj_shape[:2]
             self.batch_idx = B - 1
-            prev_traj_id = self.buffer._trajectory_id_list[self.traj_idx]
+            prev_traj_id = self._trajectory_ids[self.traj_idx]
             print(f"← Auto-switched to trajectory {prev_traj_id}")
 
     def _next_trajectory(self):
         """Jump to first step of next trajectory."""
-        if self.traj_idx < self.buffer.size - 1:
+        if self.traj_idx < len(self._trajectory_ids) - 1:
             self.traj_idx += 1
             self.step_idx = 0
             self.batch_idx = 0
             self._load_current_trajectory()
-            next_traj_id = self.buffer._trajectory_id_list[self.traj_idx]
+            next_traj_id = self._trajectory_ids[self.traj_idx]
             print(f"↑ Jumped to trajectory {next_traj_id}")
 
     def _prev_trajectory(self):
@@ -198,7 +203,7 @@ class MultiTrajectoryVisualizer:
             self.step_idx = 0
             self.batch_idx = 0
             self._load_current_trajectory()
-            prev_traj_id = self.buffer._trajectory_id_list[self.traj_idx]
+            prev_traj_id = self._trajectory_ids[self.traj_idx]
             print(f"↓ Jumped to trajectory {prev_traj_id}")
 
     def _next_batch(self):
@@ -222,8 +227,8 @@ class MultiTrajectoryVisualizer:
         try:
             target_id = int(text)
 
-            if target_id in self.buffer._trajectory_id_list:
-                self.traj_idx = self.buffer._trajectory_id_list.index(target_id)
+            if target_id in self._trajectory_ids:
+                self.traj_idx = self._trajectory_ids.index(target_id)
                 self.step_idx = 0
                 self.batch_idx = 0
                 self._load_current_trajectory()
@@ -231,7 +236,9 @@ class MultiTrajectoryVisualizer:
                 self.update_display()
             else:
                 print(
-                    f"Trajectory ID {target_id} not found. Valid IDs: {self.buffer._trajectory_id_list[:10]}{'...' if self.buffer.size > 10 else ''}"
+                    f"Trajectory ID {target_id} not found. Valid IDs: "
+                    f"{self._trajectory_ids[:10]}"
+                    f"{'...' if len(self._trajectory_ids) > 10 else ''}"
                 )
         except ValueError:
             print(f"Invalid input: '{text}'. Please enter a numeric trajectory ID.")
@@ -341,7 +348,7 @@ class MultiTrajectoryVisualizer:
             info_text.append(f"Done: {done}")
 
         title_lines = [
-            f"Trajectory ID {self.current_traj_id} (#{self.traj_idx}/{self.buffer.size - 1}) | "
+            f"Trajectory ID {self.current_traj_id} (#{self.traj_idx}/{len(self._trajectory_ids) - 1}) | "
             f"Step {self.step_idx}/{T - 1} | Batch {self.batch_idx}/{B - 1}",
             f"{' | '.join(info_text)}" if info_text else "",
             "Keys: ←→/n/p=step | ↑↓=traj | b/v=batch | s=save | Home/End | q=quit | Type traj ID in box",

@@ -42,15 +42,94 @@ def chunk_sample_weights(
 
 def apply_chunk_mask(
     per_sample_loss: torch.Tensor, weights: Optional[torch.Tensor]
-) -> torch.Tensor:
-    """Reduce ``per_sample_loss`` to a scalar, weighting by ``weights`` if
-    provided (else a plain mean). When all weights are zero the result is
-    ``0`` rather than ``NaN`` so the optimizer step is a no-op."""
+) -> tuple[torch.Tensor, int]:
+    """Reduce ``per_sample_loss`` to a scalar with weighted averaging.
+
+    Returns a ``(loss, valid_count)`` pair so callers can detect the
+    all-padded batch case and skip ``backward()`` / ``optimizer.step()``
+    / scheduler / target-update steps. Without ``valid_count`` the
+    clamped-denominator zero loss is *not* a true optimizer no-op
+    (Adam/AdamW state, weight decay, LR schedulers and SAC target soft
+    updates would still advance).
+
+    Args:
+        per_sample_loss: ``[B, ...]`` per-sample loss tensor.
+        weights: Optional ``[B, 1]`` weights from
+            :func:`chunk_sample_weights` (or ``None`` for unweighted mean).
+
+    Returns:
+        A ``(loss, valid_count)`` pair. When ``weights`` is ``None`` the
+        valid count is the leading dimension of ``per_sample_loss``;
+        otherwise it is ``int(weights.sum())``. When ``valid_count == 0``
+        the returned loss is a no-grad zero of the right dtype/device so
+        callers may still call ``loss.item()`` for logging.
+    """
     if weights is None:
-        return per_sample_loss.mean()
+        batch_size = (
+            int(per_sample_loss.shape[0]) if per_sample_loss.ndim > 0 else 1
+        )
+        return per_sample_loss.mean(), batch_size
+
+    valid_count = int(weights.sum().item())
     feature_size = per_sample_loss.numel() // per_sample_loss.shape[0]
-    denom = (weights.sum() * feature_size).clamp(min=1.0)
-    return (per_sample_loss * weights).sum() / denom
+
+    # CRIT-R7: the global all-reduce MUST happen on EVERY rank, including
+    # ranks where ``valid_count == 0``. Otherwise rank A (valid==0) skips
+    # the collective while rank B (valid>0) calls it → process group
+    # hangs. Compute the global count BEFORE any early return.
+    if (
+        torch.distributed.is_available()
+        and torch.distributed.is_initialized()
+    ):
+        world_size = torch.distributed.get_world_size()
+        count_tensor = torch.tensor(
+            [int(valid_count)], dtype=torch.long, device=per_sample_loss.device
+        )
+        torch.distributed.all_reduce(count_tensor, op=torch.distributed.ReduceOp.SUM)
+        total_count = int(count_tensor.item())
+    else:
+        world_size = 1
+        total_count = int(valid_count)
+
+    # Always start from a grad-connected sanitised tensor so backward()
+    # works regardless of whether we take the zero or valid path. NaN/Inf
+    # at masked positions (e.g. terminal next_state) get zeroed; finite
+    # positions keep their grad fn.
+    sanitized = torch.nan_to_num(
+        per_sample_loss, nan=0.0, posinf=0.0, neginf=0.0
+    )
+
+    if total_count == 0:
+        # Globally all-padded. Multiplying by 0.0 keeps the autograd
+        # graph alive so ``backward()`` triggers FSDP collectives
+        # consistently across ranks; nan_to_num guarantees finite values.
+        zero_loss = (sanitized * 0.0).sum()
+        return zero_loss, 0
+
+    if valid_count == 0:
+        # This rank is locally all-padded but at least one peer has valid
+        # samples. Contribute a graph-connected zero so FSDP's reduce-
+        # scatter sees a finite, zero contribution from this rank.
+        zero_loss = (sanitized * 0.0).sum()
+        return zero_loss, 0
+
+    # Mask invalid positions with detached zeros so their grad path is
+    # cut at this op (no NaN propagation regardless of upstream).
+    masked = torch.where(
+        weights.expand_as(per_sample_loss).to(torch.bool),
+        sanitized,
+        torch.zeros_like(sanitized),
+    )
+    # MAJ-R4-4: GLOBAL denominator. Per-rank means cause unequal-sample
+    # gradient bias under FSDP's grad averaging (a rank with 1 valid
+    # sample contributes the same weight as a rank with 512 after
+    # FSDP averages). Scale local sum by ``world_size / total_count``:
+    # FSDP then averages over world_size, recovering the global
+    # unweighted mean.
+    local_sum = (masked * weights).sum()
+    denom = float(total_count * feature_size)
+    loss = (local_sum * float(world_size)) / denom
+    return loss, valid_count
 
 _SAC_REQUIRED_TRAJECTORY_FIELDS = (
     "actions",
@@ -106,6 +185,49 @@ def _field_shape(value: Any) -> tuple[int, ...] | None:
     return tuple(int(dim) for dim in shape)
 
 
+def _expected_image_hwc(model_cfg: DictConfig) -> tuple[int, int, int] | None:
+    """Return the (H, W, C) image geometry the actor expects, if declared.
+
+    The ``image_size`` field is config-shaped per model family:
+      * CNN_POLICY / FLOW_POLICY: ``[C, H, W]`` (channels-first triple).
+      * OpenVLA / OpenVLA_OFT: ``[H, W]`` (channels default to 3).
+      * OPENPI: image geometry is owned by its image processor and is not
+        exposed here -- skip dimensional validation.
+
+    Returns ``None`` when the model does not pin an image size (so callers
+    should keep the rank-only validation only).
+    """
+    model_type = str(model_cfg.get("model_type"))
+    raw = model_cfg.get("image_size", None)
+    if raw is None:
+        return None
+    try:
+        dims = [int(x) for x in raw]
+    except (TypeError, ValueError):
+        return None
+    if model_type in {
+        SupportedModel.CNN_POLICY.value,
+        SupportedModel.FLOW_POLICY.value,
+    }:
+        if len(dims) == 3:
+            c, h, w = dims
+            return (int(h), int(w), int(c))
+        if len(dims) == 2:
+            h, w = dims
+            return (int(h), int(w), 3)
+        return None
+    # Other model families that simply list [H, W] (e.g. OpenVLA-style).
+    if len(dims) == 2:
+        h, w = dims
+        return (int(h), int(w), 3)
+    if len(dims) == 3:
+        # Channels-first by convention when three dims and not in the
+        # explicit channels-last set above.
+        c, h, w = dims
+        return (int(h), int(w), int(c))
+    return None
+
+
 def _validate_image_obs_shape(
     *,
     key: str,
@@ -115,6 +237,7 @@ def _validate_image_obs_shape(
     rank: int,
     trajectory_id: int,
     obs_name: str,
+    expected_hwc: tuple[int, int, int] | None = None,
 ) -> None:
     if key == "main_images":
         if len(obs_shape) != 5:
@@ -123,6 +246,16 @@ def _validate_image_obs_shape(
                 f"path={load_path}, rank={rank}, trajectory_id={trajectory_id}, "
                 f"{obs_name}.{key}, expected [T, B, H, W, C], shape={obs_shape}."
             )
+        if expected_hwc is not None:
+            actual_hwc = tuple(int(d) for d in obs_shape[-3:])
+            if actual_hwc != expected_hwc:
+                raise ValueError(
+                    "Loaded demo_buffer main_images do not match actor "
+                    "image_size: "
+                    f"path={load_path}, rank={rank}, trajectory_id={trajectory_id}, "
+                    f"{obs_name}.{key}, expected_HWC={expected_hwc}, "
+                    f"actual_HWC={actual_hwc}, shape={obs_shape}."
+                )
     elif key == "extra_view_images":
         if len(obs_shape) != 6:
             raise ValueError(
@@ -139,6 +272,16 @@ def _validate_image_obs_shape(
                 f"{obs_name}.{key}, expected extra views from image_num="
                 f"{expected_extra_view_count}, shape={obs_shape}."
             )
+        if expected_hwc is not None:
+            actual_hwc = tuple(int(d) for d in obs_shape[-3:])
+            if actual_hwc != expected_hwc:
+                raise ValueError(
+                    "Loaded demo_buffer extra_view_images do not match actor "
+                    "image_size: "
+                    f"path={load_path}, rank={rank}, trajectory_id={trajectory_id}, "
+                    f"{obs_name}.{key}, expected_HWC={expected_hwc}, "
+                    f"actual_HWC={actual_hwc}, shape={obs_shape}."
+                )
 
 
 def _expected_action_shapes(model_cfg: DictConfig) -> set[tuple[int, ...]]:
@@ -207,6 +350,30 @@ def _validate_required_trajectory_fields(
                 f"expected_trailing_shape={sorted(expected_action_shapes)}, "
                 f"actual_shape={action_shape}."
             )
+
+    # CRIT-R5-3: validate ``loss_mask`` trailing dim matches
+    # ``actor.model.num_action_chunks`` at LOAD time. Otherwise a mismatched
+    # demo buffer (e.g. converted with the default ``--num-action-chunks=1``
+    # for a multi-chunk training config) passes validation and then crashes
+    # at the first ``concat_batch`` with a cryptic shape error.
+    loss_mask = getattr(trajectory, "loss_mask", None)
+    expected_num_chunks = model_cfg.get("num_action_chunks", None)
+    if loss_mask is not None and expected_num_chunks is not None:
+        loss_mask_shape = _field_shape(loss_mask)
+        if (
+            loss_mask_shape is None
+            or len(loss_mask_shape) < 3
+            or int(loss_mask_shape[-1]) != int(expected_num_chunks)
+        ):
+            raise ValueError(
+                "Loaded demo_buffer trajectory loss_mask trailing dim does "
+                "not match actor.model.num_action_chunks: "
+                f"path={load_path}, rank={rank}, trajectory_id={trajectory_id}, "
+                f"loss_mask_shape={loss_mask_shape}, "
+                f"expected_num_action_chunks={int(expected_num_chunks)}. "
+                "Re-run the LeRobot converter with "
+                "`--num-action-chunks <actor.model.num_action_chunks>`."
+            )
     expected_T, expected_B = expected_prefix
     # dones/terminations/truncations may carry one extra entry per rollout
     # epoch (see EmbodiedRolloutResult and replay_buffer._flatten_trajectory),
@@ -248,6 +415,7 @@ def _validate_obs_schema(
     expected_state_dim: int | None,
     expected_extra_view_count: int | None,
     expected_prefix: tuple[int, int],
+    expected_image_hwc: tuple[int, int, int] | None = None,
 ) -> None:
     missing_keys = [
         key for key in required_obs_keys if key not in obs or obs[key] is None
@@ -293,6 +461,7 @@ def _validate_obs_schema(
                 rank=rank,
                 trajectory_id=trajectory_id,
                 obs_name=obs_name,
+                expected_hwc=expected_image_hwc,
             )
 
 
@@ -316,7 +485,19 @@ def validate_loaded_demo_buffer(
             f"min_buffer_size={min_demo_buffer_size}. {_small_shard_hint(load_mode)}"
         )
 
-    if not demo_buffer._trajectory_id_list:
+    # Use the public iterator API on the replay buffer so this validator
+    # does not bind to private internals (``_trajectory_id_list`` /
+    # ``_trajectory_index`` / ``_load_trajectory``).
+    iter_metadata = getattr(demo_buffer, "iter_trajectory_metadata", None)
+    public_load = getattr(demo_buffer, "load_trajectory", None)
+    if not callable(iter_metadata) or not callable(public_load):
+        raise TypeError(
+            "demo_buffer must expose iter_trajectory_metadata() and "
+            "load_trajectory() public methods for validation."
+        )
+
+    trajectory_metadata = list(iter_metadata())
+    if not trajectory_metadata:
         raise ValueError(
             "Loaded demo_buffer shard is empty: "
             f"path={load_path}, rank={rank}, world_size={world_size}. "
@@ -335,11 +516,9 @@ def validate_loaded_demo_buffer(
     expected_extra_view_count = (
         image_num - 1 if "extra_view_images" in required_obs_keys else None
     )
-    for trajectory_id in demo_buffer._trajectory_id_list:
-        model_weights_id = demo_buffer._trajectory_index[trajectory_id][
-            "model_weights_id"
-        ]
-        trajectory = demo_buffer._load_trajectory(trajectory_id, model_weights_id)
+    expected_image_hwc = _expected_image_hwc(model_cfg)
+    for trajectory_id, model_weights_id, _num_samples in trajectory_metadata:
+        trajectory = public_load(trajectory_id, model_weights_id)
         expected_prefix = _validate_required_trajectory_fields(
             trajectory,
             load_path=load_path,
@@ -366,4 +545,5 @@ def validate_loaded_demo_buffer(
                 expected_state_dim=expected_state_dim,
                 expected_extra_view_count=expected_extra_view_count,
                 expected_prefix=expected_prefix,
+                expected_image_hwc=expected_image_hwc,
             )

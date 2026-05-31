@@ -59,6 +59,7 @@ class LeRobotDatasetWriter:
         wrist_image_keys: dict[str, tuple[int, ...]] | None = None,
         extra_view_image_keys: dict[str, tuple[int, ...]] | None = None,
         has_intervene_flag: bool = True,
+        transition_schema: bool = False,
     ) -> None:
         """
         Create a new LeRobot dataset.
@@ -83,6 +84,13 @@ class LeRobotDatasetWriter:
                 extra-view camera(s).
             has_intervene_flag: Whether to include per-frame human-intervention
                 flag (bool, shape ``(1,)``) in auto-generated features.
+            transition_schema: When ``True`` add the transition-rich fields
+                (``next_state``, ``next_image``, ``terminated``, ``truncated``,
+                ``rewards``, and ``next_<wrist/view>`` mirrors) needed by
+                replay-buffer conversion. Defaults to ``False`` for backward
+                compatibility — older callers that emit only
+                ``state``/``actions``/``done``/``is_success``/``image`` keep
+                working with the minimal schema.
 
         """
         from lerobot.common.datasets.lerobot_dataset import LeRobotDataset
@@ -99,30 +107,10 @@ class LeRobotDatasetWriter:
                     "shape": (action_dim,),
                     "names": ["actions"],
                 },
-                "next_state": {
-                    "dtype": "float32",
-                    "shape": (state_dim,),
-                    "names": ["next_state"],
-                },
-                "rewards": {
-                    "dtype": "float32",
-                    "shape": (1,),
-                    "names": ["rewards"],
-                },
                 "done": {
                     "dtype": "bool",
                     "shape": (1,),
                     "names": ["done"],
-                },
-                "terminated": {
-                    "dtype": "bool",
-                    "shape": (1,),
-                    "names": ["terminated"],
-                },
-                "truncated": {
-                    "dtype": "bool",
-                    "shape": (1,),
-                    "names": ["truncated"],
                 },
                 "is_success": {
                     "dtype": "bool",
@@ -130,6 +118,30 @@ class LeRobotDatasetWriter:
                     "names": ["is_success"],
                 },
             }
+            if transition_schema:
+                # Transition-rich fields used by replay-buffer conversion and
+                # by callers that emit explicit next_obs / reward / split
+                # terminal flags per frame.
+                features["next_state"] = {
+                    "dtype": "float32",
+                    "shape": (state_dim,),
+                    "names": ["next_state"],
+                }
+                features["rewards"] = {
+                    "dtype": "float32",
+                    "shape": (1,),
+                    "names": ["rewards"],
+                }
+                features["terminated"] = {
+                    "dtype": "bool",
+                    "shape": (1,),
+                    "names": ["terminated"],
+                }
+                features["truncated"] = {
+                    "dtype": "bool",
+                    "shape": (1,),
+                    "names": ["truncated"],
+                }
             if has_intervene_flag:
                 features["intervene_flag"] = {
                     "dtype": "bool",
@@ -150,12 +162,13 @@ class LeRobotDatasetWriter:
                             "shape": list(shape),
                             "names": ["height", "width", "channel"],
                         }
-                        features[f"next_{key}"] = {
-                            "dtype": "image",
-                            "shape": list(shape),
-                            "names": ["height", "width", "channel"],
-                        }
-            if has_image:
+                        if transition_schema:
+                            features[f"next_{key}"] = {
+                                "dtype": "image",
+                                "shape": list(shape),
+                                "names": ["height", "width", "channel"],
+                            }
+            if has_image and transition_schema:
                 features["next_image"] = {
                     "dtype": "image",
                     "shape": list(image_shape),

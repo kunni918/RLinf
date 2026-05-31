@@ -50,6 +50,17 @@ Key Features
   ``extra_view_image-1``, …).
 - Set ``only_success=True`` to filter out failed episodes and save disk space.
 
+.. warning::
+
+   **Image channel order: RGB only.** ``CollectEpisode`` writes the raw
+   image arrays it receives directly into LeRobot frames; the LeRobot →
+   replay-buffer converter accepts those arrays **as-is and assumes
+   RGB**. If your env exposes BGR frames (OpenCV / RealWorld cameras
+   that natively output BGR), convert BGR → RGB before passing them
+   into the env's observation, or the persisted demo buffer will train
+   on color-swapped images. There is no runtime detection for channel
+   order; this is a contract.
+
 Constructor Arguments
 ~~~~~~~~~~~~~~~~~~~~~
 
@@ -191,21 +202,35 @@ The file contains a single dictionary:
 
 **LeRobot format**
 
-Data is stored as Parquet files alongside JSON metadata files:
+Data is stored as Parquet files alongside JSON metadata files. The
+``CollectEpisode`` wrapper creates a separate LeRobot dataset root per
+worker / writer batch under
+``save_dir/rank_{rank}/id_{episodes_written}/``:
 
 .. code-block:: text
 
    save_dir/
-   ├── meta/
-   │   ├── info.json           # dataset metadata (fps, robot_type, dimensions, …)
-   │   ├── episodes.jsonl      # per-episode length and task description
-   │   ├── tasks.jsonl         # deduplicated task list
-   │   └── stats.json          # mean / std statistics for observations and actions
-   └── data/
-       └── chunk-000/
-           ├── episode_000000.parquet
-           ├── episode_000001.parquet
+   └── rank_0/                   # one subdir per worker rank
+       ├── id_0/                 # one subdir per writer batch (rotated via finalize_interval)
+       │   ├── meta/
+       │   │   ├── info.json           # dataset metadata (fps, robot_type, dimensions, …)
+       │   │   ├── episodes.jsonl      # per-episode length and task description
+       │   │   ├── tasks.jsonl         # deduplicated task list
+       │   │   └── stats.json          # mean / std statistics for observations and actions
+       │   └── data/
+       │       └── chunk-000/
+       │           ├── episode_000000.parquet
+       │           ├── episode_000001.parquet
+       │           └── ...
+       └── id_1/                 # next batch after finalize_interval episodes
            └── ...
+
+.. note::
+
+   ``rank_*`` differentiates writers in distributed/vectorized rollouts.
+   ``id_*`` rotates whenever ``writer.finalize()`` is invoked
+   (e.g. every ``finalize_interval`` episodes), so a single rank may emit
+   multiple LeRobot roots.
 
 Parquet column schema:
 
@@ -342,15 +367,19 @@ Configuration Parameters
    * - ``runner.num_data_episodes``
      - ``20``
      - Target number of successful demonstrations; stops when reached
-   * - ``cluster.node_groups.hardware.configs.robot_ip``
+   * - ``cluster.node_groups[0].hardware.configs[0].robot_ip``
      - —
-     - IP address of the Franka robot
+     - IP address of the Franka robot. ``node_groups`` and ``configs`` are
+       YAML lists; see :ref:`realworld-collect-yaml-shape` below.
    * - ``env.eval.use_spacemouse``
      - ``True``
      - Enable SpaceMouse intervention
    * - ``env.eval.no_gripper``
-     - ``False``
-     - Whether the real-world env uses a 6-DoF action without a gripper dimension
+     - ``True`` (wrapper default when key is absent;
+       not set by the shipped config)
+     - Whether the real-world env uses a 6-DoF action without a gripper
+       dimension. The single-arm wrapper applies ``GripperCloseEnv`` when
+       this is True.
    * - ``env.eval.use_gello``
      - ``False``
      - Enable GELLO teleoperation (mutually exclusive with SpaceMouse)
@@ -364,7 +393,7 @@ Configuration Parameters
      - ``1``
      - Number of consecutive steps at goal pose required to declare success
    * - ``runner.record_task_description``
-     - ``True``
+     - ``False`` (per shipped ``realworld_collect_data.yaml``)
      - Whether to include the task description string in observations
 
 Data Format
@@ -377,34 +406,55 @@ After collection, data is saved to:
    logs/{timestamp}/demos/
 
 ``TrajectoryReplayBuffer`` stores each trajectory as a ``.pt`` file.
-Each trajectory contains:
+Each saved ``.pt`` file holds a ``Trajectory`` dataclass
+(:class:`rlinf.data.embodied_io_struct.Trajectory`) whose **top-level**
+fields are serialized directly — there is no ``"transitions"`` wrapper:
 
 .. code-block:: python
 
-   {
-       "transitions": {
-           "obs": {
-               "states":      # robot state, shape=[T, 19] (pose, torques, …)
-               "main_images"  # main camera images, shape=[T, 128, 128, 3], uint8
-           },
-           "next_obs": {
-               "states":      # next-step robot state
-               "main_images"  # next-step camera images
-           },
-           "action":          # action, shape=[T, 6]
-           "rewards":         # reward, shape=[T, 1]
-           "dones":           # done flag, shape=[T, 1], bool
-           "terminations":    # termination flag, shape=[T, 1], bool
-           "truncations":     # truncation flag, shape=[T, 1], bool
+   # rlinf.data.embodied_io_struct.Trajectory
+   Trajectory(
+       max_episode_length=int,             # scalar
+       model_weights_id=str,               # uuid derived from model versions
+       actions=torch.Tensor,               # [T, B, action_dim] (or with chunk dim)
+       intervene_flags=torch.Tensor,       # [T, B, ...] bool, per-step intervention
+       rewards=torch.Tensor,               # [T, B, 1]
+       terminations=torch.Tensor,          # [T, B, 1] bool
+       truncations=torch.Tensor,           # [T, B, 1] bool
+       dones=torch.Tensor,                 # [T, B, 1] bool
+       loss_mask=Optional[torch.Tensor],   # [T, B, num_action_chunks] when set
+       forward_inputs=dict,                # producer-specific forward kwargs
+       curr_obs={                          # observation dict at step t
+           "states":      ...,             # robot state, e.g. [T, B, 19]
+           "main_images": ...,              # main camera, e.g. [T, B, H, W, C] uint8
+           # other observation keys (wrist_images, extra_view_images, ...)
        },
-       "intervene_flags":     # all ones, marking this trajectory as expert data
-   }
+       next_obs={                          # observation dict at step t+1
+           "states":      ...,
+           "main_images": ...,
+       },
+   )
 
 .. note::
 
-   ``intervene_flags`` is set to all ones to mark the trajectory as an expert
-   demonstration. During RLPD training this flag distinguishes prior data from
-   online policy rollouts.
+   ``intervene_flags`` semantics differ between the in-flight rollout and
+   the persisted real-robot demo trajectory:
+
+   - During the rollout (``EmbodiedRolloutResult``) the flags are
+     **per-step booleans** sourced from ``info["intervene_flag"]`` (e.g.
+     the SpaceMouse / GELLO intervention path).
+   - When ``examples/embodiment/collect_real_data.py`` writes a
+     successful trajectory to the replay buffer, every step is
+     **overwritten to True** via ``torch.ones_like(...)`` so the
+     trajectory is treated as fully expert by RLPD/SAC-demo training. This
+     matches the operator contract: a saved successful real-robot demo is
+     intended as expert teleop data regardless of which substeps the
+     operator nudged.
+
+   If your training expects the original per-step flags from a real-robot
+   collect, read them from the rollout-side ``Trajectory`` before the
+   ``collect_real_data`` post-processing, not from the persisted demo
+   buffer.
 
 Collect Replay Buffer And LeRobot Data Together
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -441,15 +491,31 @@ Usage Steps
       source <path_to_your_venv>/bin/activate
 
 2. Edit ``examples/embodiment/config/realworld_collect_data.yaml`` to replace
-   ``ROBOT_IP`` and ``TARGET_EE_POSE`` with your actual robot IP and target pose:
+   ``ROBOT_IP`` and ``TARGET_EE_POSE`` with your actual robot IP and target pose.
+
+   .. _realworld-collect-yaml-shape:
+
+   ``cluster.node_groups`` is a YAML list, and each entry's
+   ``hardware.configs`` is also a list (one entry per robot on that node
+   group). Match the structure of the shipped
+   ``examples/embodiment/config/realworld_collect_data.yaml``:
 
    .. code-block:: yaml
 
       cluster:
+        num_nodes: 1
+        component_placement:
+          env:
+            node_group: franka
+            placement: 0
         node_groups:
-          hardware:
-            configs:
-              robot_ip: "192.168.1.100"   # replace with actual IP
+          - label: franka
+            node_ranks: 0
+            hardware:
+              type: Franka
+              configs:
+                - robot_ip: "192.168.1.100"   # replace with actual IP
+                  node_rank: 0
 
       env:
         eval:
@@ -523,14 +589,23 @@ Use the existing replay-buffer visualizer to inspect trajectories in
 
 Use ``toolkits/lerobot/visualize_lerobot_dataset.py`` to expand a LeRobot
 dataset into per-episode folders containing ``.jpg`` images and ``.txt`` step
-metadata:
+metadata. The visualizer reads ``meta/info.json`` directly under the path
+you pass, so point ``--dataset-path`` at one **concrete** LeRobot root
+(``save_dir/rank_*/id_*``), not the parent ``collected_data/`` directory:
 
 .. code-block:: bash
 
    python toolkits/lerobot/visualize_lerobot_dataset.py \
-       --dataset-path logs/{timestamp}/collected_data \
-       --output-dir logs/{timestamp}/collected_data_visualized
+       --dataset-path logs/{timestamp}/collected_data/rank_0/id_0 \
+       --output-dir logs/{timestamp}/collected_data_visualized/rank_0_id_0
 
-The tool reads ``meta/info.json`` plus each ``episode_*.parquet`` file, then
-creates output like ``episode_000000/step_000003_image.jpg`` and
+To inspect every collected root, run the command once per
+``rank_*/id_*`` directory (for example with a shell loop). The
+replay-buffer converter, in contrast, accepts the parent
+``collected_data/`` directory because it walks nested
+``rank_*/id_*/data/**/*.parquet`` roots automatically.
+
+The tool reads ``meta/info.json`` plus each ``episode_*.parquet`` file
+within the supplied root, then creates output like
+``episode_000000/step_000003_image.jpg`` and
 ``episode_000000/step_000003.txt`` for quick inspection.

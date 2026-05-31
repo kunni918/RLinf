@@ -130,6 +130,37 @@ class EnvWorker(Worker):
                 for _ in range(self.stage_num)
             ]
 
+    def _close(self) -> None:
+        """Graceful actor shutdown hook (called by WorkerGroup before kill).
+
+        Without this hook ``ray.kill`` tears the actor down before
+        ``CollectEpisode``'s ``ThreadPoolExecutor`` and LeRobot image
+        writers finish draining. That can silently drop recorded episodes.
+        We try every env wrapper, swallow per-env errors so one failure
+        does not orphan the rest, and re-raise the first one (if any) so
+        the supervisor sees the failure.
+        """
+        first_error: BaseException | None = None
+        for env in list(self.env_list) + list(self.eval_env_list):
+            close_fn = getattr(env, "close", None)
+            if not callable(close_fn):
+                continue
+            try:
+                close_fn()
+            except BaseException as exc:  # noqa: BLE001 — drain everything
+                if first_error is None:
+                    first_error = exc
+                # Best-effort log; do not block other env closes.
+                try:
+                    self.log_warning(
+                        f"EnvWorker._close: error closing env "
+                        f"{type(env).__name__}: {exc!r}"
+                    )
+                except Exception:
+                    pass
+        if first_error is not None:
+            raise first_error
+
     def init_worker(self):
         self.dst_rank_map = self._setup_dst_rank_map()
         self.src_rank_map = self._setup_src_rank_map()
@@ -430,15 +461,32 @@ class EnvWorker(Worker):
         if not self.cfg.env.train.auto_reset:
             if self.cfg.env.train.ignore_terminations:
                 if chunk_truncations.any():
-                    assert chunk_truncations.any(dim=1).all()
+                    # NOTE: previously asserted that EVERY env truncated
+                    # somewhere in the chunk (``.any(dim=1).all()``).  That
+                    # crashed legitimate mixed-vector cases (env 0
+                    # truncates mid-chunk, env 1 keeps running).  Collect
+                    # metrics only for the envs that did truncate.
                     self._collect_chunk_final_episode_info(
                         env_info, infos_list, chunk_truncations
                     )
-                    if not env_info and "episode" in infos:
+                    if not env_info:
+                        self._collect_chunk_episode_info_from_substep(
+                            env_info, infos_list, chunk_truncations
+                        )
+                    if not env_info and isinstance(infos, dict) and "episode" in infos:
                         for key in infos["episode"]:
                             env_info[key] = infos["episode"][key].cpu()
             else:
-                if "episode" in infos:
+                # `_handle_auto_reset` does not run when auto_reset=False, so
+                # the padded tail substep (infos[-1]) typically has no
+                # `episode` dict. Scan the chunk for the substep where each
+                # env actually terminated and pull the per-env metrics from
+                # there.
+                if chunk_dones.any():
+                    self._collect_chunk_episode_info_from_substep(
+                        env_info, infos_list, chunk_dones
+                    )
+                if not env_info and isinstance(infos, dict) and "episode" in infos:
                     for key in infos["episode"]:
                         env_info[key] = infos["episode"][key].cpu()
         elif chunk_dones.any():
@@ -527,6 +575,16 @@ class EnvWorker(Worker):
             self._collect_chunk_final_episode_info(
                 env_info, infos_list, newly_done_steps
             )
+            # Eval mirror of the train-path fix (CRIT-2 / MAJ-I-1): when the
+            # ``final_info`` scan finds nothing because the chunk helper did
+            # not emit one under ``auto_reset=False``, fall back to scanning
+            # ``infos_list`` for the substep where each env actually
+            # terminated. Otherwise mid-chunk eval episodes silently lose
+            # success/return/episode_len metrics.
+            if not env_info:
+                self._collect_chunk_episode_info_from_substep(
+                    env_info, infos_list, newly_done_steps
+                )
             if not env_info and isinstance(infos, dict) and "episode" in infos:
                 newly_done = newly_done_steps.any(dim=1)
                 for key in infos["episode"]:
@@ -553,6 +611,58 @@ class EnvWorker(Worker):
                 continue
             for key, value in final_info["episode"].items():
                 selected_value = value[done_mask].cpu()
+                if key in env_info:
+                    env_info[key] = torch.cat([env_info[key], selected_value], dim=0)
+                else:
+                    env_info[key] = selected_value
+
+    def _collect_chunk_episode_info_from_substep(
+        self, env_info, infos_list, done_steps
+    ):
+        """Fallback: scrape per-env ``episode`` metrics from the substep where
+        each env actually terminated.
+
+        With ``auto_reset=False`` the realworld chunk helper never produces
+        ``final_info`` (that key is set only by ``_handle_auto_reset``). The
+        padded tail substep therefore lacks an ``episode`` dict, which would
+        otherwise cause ``success``/``return``/``episode_len`` to be silently
+        dropped. This method walks ``infos_list`` for each env, picks the
+        substep matching ``done_steps`` for that env, and copies the
+        per-env ``episode`` values out for logging.
+        """
+        if not isinstance(infos_list, (list, tuple)) or not infos_list:
+            return
+        if done_steps.ndim != 2:
+            return
+
+        num_envs, chunk_size = done_steps.shape
+        env_done_indices = done_steps.to(torch.int64).argmax(dim=1).cpu()
+        env_has_done = done_steps.any(dim=1).cpu()
+
+        for env_idx in range(num_envs):
+            if not bool(env_has_done[env_idx].item()):
+                continue
+            step_idx = int(env_done_indices[env_idx].item())
+            if step_idx < 0 or step_idx >= chunk_size:
+                continue
+            step_infos = infos_list[step_idx]
+            if not isinstance(step_infos, dict):
+                continue
+            episode = step_infos.get("episode")
+            # Try `final_info["episode"]` first when present (auto-reset path
+            # if it ever runs), otherwise fall back to the substep's own
+            # `episode` dict written by `_record_metrics`.
+            final_info = step_infos.get("final_info")
+            if isinstance(final_info, dict) and "episode" in final_info:
+                episode = final_info["episode"]
+            if not isinstance(episode, dict):
+                continue
+            for key, value in episode.items():
+                if not isinstance(value, torch.Tensor):
+                    continue
+                if value.dim() == 0 or value.shape[0] <= env_idx:
+                    continue
+                selected_value = value[env_idx : env_idx + 1].detach().cpu()
                 if key in env_info:
                     env_info[key] = torch.cat([env_info[key], selected_value], dim=0)
                 else:

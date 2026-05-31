@@ -193,10 +193,17 @@ class EmbodiedDAGGERFSDPPolicy(EmbodiedFSDPActor):
             self.load_param_and_grad(self.device)
             self.load_optimizer(self.device)
 
+        # CRIT-R5-2 (same hazard as the SAC worker, CRIT-R4-2): readiness MUST
+        # be globally agreed across FSDP ranks. One rank returning while
+        # peers enter ``update_one_epoch`` (which calls FSDP-collective
+        # backward / clip / all_reduce) hangs the process group. Use the
+        # same global-AND helper pattern.
         min_buffer_size = self.cfg.algorithm.replay_buffer.get("min_buffer_size", 100)
-        if not self.replay_buffer.is_ready(min_buffer_size):
+        local_ready = bool(self.replay_buffer.is_ready(min_buffer_size))
+        if not self._global_all_ranks_dagger(local_ready):
             self.log_on_first_rank(
-                f"Replay buffer size {len(self.replay_buffer)} < {min_buffer_size}, skipping training"
+                f"Replay buffer size {len(self.replay_buffer)} < {min_buffer_size} "
+                "on some rank, skipping training"
             )
             return {}
 
@@ -266,3 +273,22 @@ class EmbodiedDAGGERFSDPPolicy(EmbodiedFSDPActor):
             load_base_path, f"dagger_components/replay_buffer/rank_{self._rank}"
         )
         self.replay_buffer.load_checkpoint(buffer_load_path)
+
+    def _global_all_ranks_dagger(self, local_bool: bool) -> bool:
+        """All-reduce MIN — true only if every FSDP rank is true.
+
+        Mirrors :meth:`EmbodiedSACFSDPPolicy._global_all_ranks`; kept
+        local to this worker so DAgger doesn't take a dependency on the
+        SAC worker class. Used to gate branches that change FSDP
+        collective participation (replay-buffer readiness, etc.).
+        """
+        if (
+            torch.distributed.is_available()
+            and torch.distributed.is_initialized()
+        ):
+            flag = torch.tensor(
+                [1 if local_bool else 0], dtype=torch.long, device=self.device
+            )
+            torch.distributed.all_reduce(flag, op=torch.distributed.ReduceOp.MIN)
+            return bool(int(flag.item()))
+        return bool(local_bool)

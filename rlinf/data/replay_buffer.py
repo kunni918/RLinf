@@ -18,6 +18,7 @@ import json
 import os
 import pickle as pkl
 import shutil
+import tempfile
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from typing import Optional
@@ -306,6 +307,25 @@ class TrajectoryReplayBuffer:
         # Separate executor for checkpoint saves
         self._checkpoint_executor = ThreadPoolExecutor(max_workers=20)
         self._index_lock = threading.Lock()
+        # Track every flush/metadata write future submitted to
+        # ``_save_executor`` so ``close(wait=True)`` can drain them via
+        # ``.result()`` — otherwise async ``torch.save`` / pickle / metadata
+        # failures are silently swallowed and the CLI exits "successfully"
+        # with an incomplete checkpoint.
+        self._pending_save_futures: list = []
+        self._pending_save_lock = threading.Lock()
+        # CRIT-R8: ``close(wait=True)`` snapshots & clears the pending
+        # list under the lock. A concurrent ``add_trajectories`` that
+        # acquires the lock AFTER close drained would submit a future
+        # close cannot await, swallowing its error. Refuse new
+        # submissions once close has been invoked.
+        self._closed: bool = False
+        # Trajectory IDs whose payload file is durable on disk. Persisted
+        # metadata/index ONLY references this set — otherwise a concurrent
+        # ``add_trajectories`` could publish IDs whose ``.pt`` files have
+        # not finished writing, leaving an index that lies about file
+        # existence after a crash. Mutated under ``_index_lock``.
+        self._durable_trajectory_ids: set[int] = set()
 
         # Cached window metadata for faster sampling
         self._window_cache_size = None
@@ -354,29 +374,167 @@ class TrajectoryReplayBuffer:
         base_dir = base_dir or self.auto_save_path
         return os.path.join(base_dir, "trajectory_index.json")
 
-    def _save_metadata(self, save_path: Optional[str] = None):
-        """Save metadata to disk."""
+    @staticmethod
+    def _atomic_write_binary(target_path: str, writer) -> None:
+        """Atomic binary write via temp file + ``os.replace``.
+
+        ``writer`` is a callable that receives an opened binary file object
+        and writes the payload into it. Used for ``torch.save`` / pickle so
+        a crash mid-write doesn't leave a corrupt ``.pt`` / ``.pkl`` at the
+        final path (which would later poison ``torch.load`` / ``pickle.load``).
+        """
+        dirpath = os.path.dirname(target_path) or "."
+        os.makedirs(dirpath, exist_ok=True)
+        fd, tmp_path = tempfile.mkstemp(
+            prefix=".tmp-",
+            suffix=os.path.splitext(target_path)[1],
+            dir=dirpath,
+        )
+        try:
+            with os.fdopen(fd, "wb") as f:
+                writer(f)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp_path, target_path)
+        except BaseException:
+            try:
+                os.unlink(tmp_path)
+            except FileNotFoundError:
+                pass
+            raise
+
+    @staticmethod
+    def _atomic_write_json(target_path: str, payload) -> None:
+        """Write ``payload`` to ``target_path`` atomically.
+
+        Partial JSON on a crash/Ctrl-C is indistinguishable from an
+        intended checkpoint until parsing fails later. Write to a temp
+        file in the same directory, fsync, then ``os.replace`` to swap
+        atomically.
+        """
+        dirpath = os.path.dirname(target_path) or "."
+        os.makedirs(dirpath, exist_ok=True)
+        fd, tmp_path = tempfile.mkstemp(
+            prefix=".tmp-",
+            suffix=".json",
+            dir=dirpath,
+        )
+        try:
+            with os.fdopen(fd, "w") as f:
+                json.dump(payload, f)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp_path, target_path)
+        except BaseException:
+            # On any failure, remove the temp file so we don't leak junk.
+            try:
+                os.unlink(tmp_path)
+            except FileNotFoundError:
+                pass
+            raise
+
+    def _save_metadata(
+        self,
+        save_path: Optional[str] = None,
+        included_ids: Optional[set] = None,
+    ):
+        """Save metadata to disk atomically.
+
+        Only counts trajectories whose payload files are durable on disk
+        (a concurrent ``add_trajectories`` could otherwise publish an ID
+        whose ``.pt`` is still being written, leaving the metadata index
+        referencing nonexistent files after a crash).
+
+        Args:
+            included_ids: When provided, scope persisted counts/index to
+                exactly this set (intersected with the durable set). Used
+                by :meth:`save_checkpoint` so a partial checkpoint's
+                metadata doesn't lie about which trajectory files exist
+                under ``save_path`` (MAJ-R4-1).
+        """
         save_path = save_path or self.auto_save_path
         with self._index_lock:
+            if self.auto_save:
+                durable = self._durable_trajectory_ids
+                if included_ids is not None:
+                    durable = durable & set(included_ids)
+                num_durable = len(durable)
+                total_samples_durable = sum(
+                    int(self._trajectory_index[tid]["num_samples"])
+                    for tid in durable
+                    if tid in self._trajectory_index
+                )
+            else:
+                if included_ids is not None:
+                    eligible = [
+                        tid for tid in self._trajectory_id_list
+                        if tid in included_ids
+                    ]
+                    num_durable = len(eligible)
+                    total_samples_durable = sum(
+                        int(self._trajectory_index[tid]["num_samples"])
+                        for tid in eligible
+                        if tid in self._trajectory_index
+                    )
+                else:
+                    num_durable = self.size
+                    total_samples_durable = self._total_samples
             metadata = {
                 "trajectory_format": self.trajectory_format,
-                "size": self.size,
-                "total_samples": self._total_samples,
+                "size": num_durable,
+                "total_samples": total_samples_durable,
                 "trajectory_counter": self._trajectory_counter,
                 "seed": self.seed,
             }
-            with open(self._get_metadata_path(save_path), "w") as f:
-                json.dump(metadata, f)
+        # Release the lock before fsync; samplers don't need to wait on disk.
+        self._atomic_write_json(self._get_metadata_path(save_path), metadata)
 
-    def _save_trajectory_index(self, save_path: Optional[str] = None):
-        """Save trajectory index to disk."""
+    def _save_trajectory_index(
+        self,
+        save_path: Optional[str] = None,
+        included_ids: Optional[set] = None,
+    ):
+        """Save trajectory index to disk atomically.
+
+        Persists ONLY trajectory IDs whose payload files are durable; see
+        :meth:`_save_metadata` for the rationale and ``included_ids``.
+        """
         with self._index_lock:
-            index_data = {
-                "trajectory_index": copy.deepcopy(self._trajectory_index),
-                "trajectory_id_list": list(self._trajectory_id_list),
-            }
-            with open(self._get_trajectory_index_path(save_path), "w") as f:
-                json.dump(index_data, f)
+            if self.auto_save:
+                durable = self._durable_trajectory_ids
+                if included_ids is not None:
+                    durable = durable & set(included_ids)
+                index_data = {
+                    "trajectory_index": {
+                        tid: copy.deepcopy(self._trajectory_index[tid])
+                        for tid in self._trajectory_id_list
+                        if tid in durable and tid in self._trajectory_index
+                    },
+                    "trajectory_id_list": [
+                        tid for tid in self._trajectory_id_list if tid in durable
+                    ],
+                }
+            else:
+                if included_ids is not None:
+                    selected = set(included_ids)
+                    index_data = {
+                        "trajectory_index": {
+                            tid: copy.deepcopy(self._trajectory_index[tid])
+                            for tid in self._trajectory_id_list
+                            if tid in selected and tid in self._trajectory_index
+                        },
+                        "trajectory_id_list": [
+                            tid for tid in self._trajectory_id_list if tid in selected
+                        ],
+                    }
+                else:
+                    index_data = {
+                        "trajectory_index": copy.deepcopy(self._trajectory_index),
+                        "trajectory_id_list": list(self._trajectory_id_list),
+                    }
+        self._atomic_write_json(
+            self._get_trajectory_index_path(save_path), index_data
+        )
 
     def _save_trajectory(
         self,
@@ -397,11 +555,20 @@ class TrajectoryReplayBuffer:
             if value is not None:
                 trajectory_dict[field_name] = clone_dict_of_tensors(value)
 
-        if self.trajectory_format == "pt":
-            torch.save(trajectory_dict, trajectory_path)
-        else:
-            with open(trajectory_path, "wb") as f:
-                pkl.dump(trajectory_dict, f)
+        self._atomic_write_binary(
+            trajectory_path,
+            (
+                (lambda f: torch.save(trajectory_dict, f))
+                if self.trajectory_format == "pt"
+                else (lambda f: pkl.dump(trajectory_dict, f))
+            ),
+        )
+        # File is durable on disk; promote this trajectory id so the next
+        # metadata/index flush includes it. This guarantees the persisted
+        # index never references a trajectory whose payload write is still
+        # in flight.
+        with self._index_lock:
+            self._durable_trajectory_ids.add(trajectory_id)
 
     def _load_trajectory(self, trajectory_id: int, model_weights_id: str) -> Trajectory:
         """Load a trajectory from disk and reconstruct Trajectory object."""
@@ -452,7 +619,6 @@ class TrajectoryReplayBuffer:
         save_futures = []
         for trajectory in trajectories:
             model_weights_id = trajectory.model_weights_id
-            trajectory_id = self._trajectory_counter
 
             # Calculate total samples: T * B
             if trajectory.prev_logprobs is not None:
@@ -466,21 +632,11 @@ class TrajectoryReplayBuffer:
             else:
                 continue  # Skip empty trajectories
 
-            # Save trajectory to disk if enabled
-            if self.auto_save:
-                # Save asynchronously to reduce I/O stalls
-                save_futures.append(
-                    self._save_executor.submit(
-                        self._save_trajectory,
-                        trajectory,
-                        trajectory_id,
-                        model_weights_id,
-                    )
-                )
-                self._trajectory_file_path[trajectory_id] = self.auto_save_path
-
-            # Add to index
+            # Allocate the trajectory_id INSIDE the lock so concurrent
+            # add_trajectories calls don't read the same counter, submit
+            # writes to the same filename, and race the index update.
             with self._index_lock:
+                trajectory_id = self._trajectory_counter
                 trajectory_info = {
                     "num_samples": num_samples,
                     "trajectory_id": trajectory_id,
@@ -490,12 +646,37 @@ class TrajectoryReplayBuffer:
                 }
                 self._trajectory_index[trajectory_id] = trajectory_info
                 self._trajectory_id_list.append(trajectory_id)
-
-                # Update counters
                 self._trajectory_counter += 1
                 self.size += 1
                 self._total_samples += num_samples
                 self._index_version += 1
+                if self.auto_save:
+                    self._trajectory_file_path[trajectory_id] = self.auto_save_path
+
+            # CRIT-R7 + CRIT-R8: MAJ-R4-3 race fully closed. Hold the
+            # pending-save lock for the ENTIRE submit→append sequence so
+            # a concurrent ``close(wait=True)`` cannot snapshot-and-clear
+            # the pending list between our ``submit()`` and our
+            # ``append()``. Also reject new submissions after close was
+            # invoked: otherwise close-first ordering (close drains
+            # empty list, then add submits) would leak the future and
+            # silently swallow its error.
+            if self.auto_save:
+                with self._pending_save_lock:
+                    if self._closed:
+                        raise RuntimeError(
+                            "Cannot add trajectories: TrajectoryReplayBuffer "
+                            "has already been closed. ``close()`` must run "
+                            "after the last writer."
+                        )
+                    future = self._save_executor.submit(
+                        self._save_trajectory,
+                        trajectory,
+                        trajectory_id,
+                        model_weights_id,
+                    )
+                    self._pending_save_futures.append(future)
+                save_futures.append(future)
 
             if self._flat_trajectory_cache is not None:
                 self._flat_trajectory_cache.put(
@@ -503,7 +684,7 @@ class TrajectoryReplayBuffer:
                     self._flatten_trajectory(trajectory),
                 )
 
-        # Save metadata/index after all trajectory saves finish
+        # Save metadata/index after all trajectory saves finish.
         if self.auto_save:
 
             def _flush_metadata():
@@ -512,7 +693,16 @@ class TrajectoryReplayBuffer:
                 self._save_metadata()
                 self._save_trajectory_index()
 
-            self._save_executor.submit(_flush_metadata)
+            # Same pattern: keep submit and append under the same lock so
+            # the flush future cannot be lost by a concurrent close().
+            with self._pending_save_lock:
+                if self._closed:
+                    raise RuntimeError(
+                        "Cannot flush metadata: TrajectoryReplayBuffer "
+                        "has already been closed."
+                    )
+                flush_future = self._save_executor.submit(_flush_metadata)
+                self._pending_save_futures.append(flush_future)
 
     def _reshape_flat_for_save(self, value: object, T: int, B: int) -> object:
         if isinstance(value, torch.Tensor):
@@ -527,7 +717,35 @@ class TrajectoryReplayBuffer:
         return value
 
     def close(self, wait: bool = True):
-        """Flush and shutdown async save executor."""
+        """Flush and shutdown async save executor.
+
+        When ``wait`` is true (default), drain every pending save / metadata
+        flush future and re-raise the first exception so that silent
+        persistence failures (``torch.save``, pickle, metadata write) are
+        surfaced to the caller instead of being swallowed by executor
+        shutdown.
+        """
+        if wait and self._save_executor is not None:
+            with self._pending_save_lock:
+                # Atomically mark closed under the lock so no concurrent
+                # add_trajectories can submit AFTER we snapshot pending.
+                self._closed = True
+                pending = list(self._pending_save_futures)
+                self._pending_save_futures.clear()
+            first_error: Optional[BaseException] = None
+            for fut in pending:
+                try:
+                    fut.result()
+                except BaseException as exc:
+                    if first_error is None:
+                        first_error = exc
+            if first_error is not None:
+                # Always shut down the executor before surfacing the error so
+                # we never leak threads / handles.
+                self._save_executor.shutdown(wait=True)
+                if self._checkpoint_executor is not None:
+                    self._checkpoint_executor.shutdown(wait=True)
+                raise first_error
         if self._save_executor is not None:
             self._save_executor.shutdown(wait=wait)
         if self._checkpoint_executor is not None:
@@ -563,21 +781,41 @@ class TrajectoryReplayBuffer:
         if self._total_samples == 0:
             raise RuntimeError("Cannot sample from an empty buffer.")
 
-        # Sample from the most recent trajectories (windowed)
+        # Sample from the most recent trajectories (windowed).
+        # CRIT-R5-1 (extends CRIT-R4-3): the window MUST be filtered against
+        # ``_durable_trajectory_ids`` when ``auto_save`` is on; otherwise a
+        # concurrent ``add_trajectories`` publishes the new id into the
+        # in-memory index before its ``.pt`` is written and
+        # ``_load_trajectory`` later crashes with ``FileNotFoundError`` on
+        # the pending file. The cache key now includes the durable count so
+        # the window invalidates whenever a save completes.
         window_size = max(0, int(self.sample_window_size))
         with self._index_lock:
-            if (
-                self._window_cache_size == window_size
-                and self._window_cache_version == self._index_version
-            ):
+            durable_count = (
+                len(self._durable_trajectory_ids) if self.auto_save else None
+            )
+            cache_key = (window_size, self._index_version, durable_count)
+            cached_key = (
+                self._window_cache_size,
+                self._window_cache_version,
+                getattr(self, "_window_cache_durable_count", None),
+            )
+            if cache_key == cached_key:
                 window_ids = self._window_cache_ids
                 cumulative_ends = self._window_cache_cumulative_ends
                 window_total_samples = self._window_cache_total_samples
             else:
-                if window_size > 0:
-                    window_ids = list(self._trajectory_id_list[-window_size:])
+                if self.auto_save:
+                    durable = self._durable_trajectory_ids
+                    eligible = [
+                        tid for tid in self._trajectory_id_list if tid in durable
+                    ]
                 else:
-                    window_ids = list(self._trajectory_id_list)
+                    eligible = list(self._trajectory_id_list)
+                if window_size > 0:
+                    window_ids = eligible[-window_size:]
+                else:
+                    window_ids = eligible
 
                 cumulative_ends = []
                 running = 0
@@ -588,6 +826,7 @@ class TrajectoryReplayBuffer:
 
                 self._window_cache_size = window_size
                 self._window_cache_version = self._index_version
+                self._window_cache_durable_count = durable_count
                 self._window_cache_ids = window_ids
                 self._window_cache_cumulative_ends = cumulative_ends
                 self._window_cache_cumulative_ends_tensor = (
@@ -880,6 +1119,89 @@ class TrajectoryReplayBuffer:
 
         return batch
 
+    def iter_trajectory_metadata(self):
+        """Yield ``(trajectory_id, model_weights_id, num_samples)`` per trajectory.
+
+        Stable public view over the internal trajectory index so external
+        callers (e.g. SAC demo-buffer validation) do not depend on the
+        private ``_trajectory_id_list`` / ``_trajectory_index`` attributes.
+        Yields metadata only — no trajectory payload is loaded.
+
+        CRIT-R7: only yields trajectories whose payload file is actually
+        durable on disk (or whose data is in-memory when ``auto_save`` is
+        off). Yielding pending in-flight ids would invite consumers to
+        call ``load_trajectory()`` before the ``.pt`` finishes writing,
+        which would crash with ``FileNotFoundError``.
+        """
+        with self._index_lock:
+            if self.auto_save:
+                ids_snapshot = [
+                    tid for tid in self._trajectory_id_list
+                    if tid in self._durable_trajectory_ids
+                ]
+            else:
+                ids_snapshot = list(self._trajectory_id_list)
+            index_snapshot = {
+                tid: dict(self._trajectory_index[tid])
+                for tid in ids_snapshot
+                if tid in self._trajectory_index
+            }
+        for trajectory_id in ids_snapshot:
+            info = index_snapshot.get(trajectory_id)
+            if info is None:
+                continue
+            yield (
+                trajectory_id,
+                info.get("model_weights_id", ""),
+                int(info.get("num_samples", 0)),
+            )
+
+    def load_trajectory(
+        self, trajectory_id: int, model_weights_id: str
+    ) -> Trajectory:
+        """Public wrapper around :meth:`_load_trajectory`.
+
+        Loads a single trajectory by id (and the model-weights id it was
+        saved under). Lets validation / debugging tools avoid the private
+        underscore method on the replay-buffer class.
+        """
+        return self._load_trajectory(trajectory_id, model_weights_id)
+
+    def get_trajectory_info(self, trajectory_id: int) -> dict:
+        """Return the stored metadata dict for a single trajectory.
+
+        Provides a stable public view over the internal trajectory index so
+        external tools (e.g. visualizers) do not have to access
+        ``_trajectory_index`` directly. The returned dict typically
+        contains ``model_weights_id``, ``num_samples`` and ``shape``.
+        """
+        with self._index_lock:
+            info = self._trajectory_index.get(trajectory_id)
+            if info is None:
+                raise KeyError(
+                    f"trajectory_id={trajectory_id} not present in the "
+                    "replay buffer index."
+                )
+            return dict(info)
+
+    def list_trajectory_ids(self) -> list:
+        """Return a snapshot of trajectory ids in insertion order.
+
+        Public, lock-protected view over the internal ordered list. Allows
+        tools to enumerate trajectories without touching
+        ``_trajectory_id_list``. When ``auto_save`` is enabled, only
+        durable ids (payload file already on disk) are returned so a
+        subsequent ``load_trajectory()`` cannot race a still-pending
+        save.
+        """
+        with self._index_lock:
+            if self.auto_save:
+                return [
+                    tid for tid in self._trajectory_id_list
+                    if tid in self._durable_trajectory_ids
+                ]
+            return list(self._trajectory_id_list)
+
     def __len__(self) -> int:
         """Return current buffer size (number of trajectories)."""
         return self.size
@@ -889,28 +1211,47 @@ class TrajectoryReplayBuffer:
         """Return total number of samples across all trajectories."""
         return self._total_samples
 
+    def _ready_size(self) -> int:
+        """Return the count safe to advertise to readiness/sampling callers.
+
+        When ``auto_save`` is enabled, in-flight trajectories (added but
+        whose payload save has not finished) are excluded. Without this,
+        ``sample_chunks`` could select an in-flight trajectory and crash
+        with ``FileNotFoundError`` before the async write completes
+        (CRIT-R4-3).
+        """
+        if self.auto_save:
+            with self._index_lock:
+                return len(self._durable_trajectory_ids)
+        return self.size
+
     def is_ready(self, min_size: int) -> bool:
         """Check if buffer has enough samples for training."""
-        return self.size >= min_size
+        return self._ready_size() >= min_size
 
     async def is_ready_async(self, min_size: int) -> bool:
         """Check if buffer has enough samples for training."""
-        return self.size >= min_size
+        return self._ready_size() >= min_size
 
     def clear(self):
-        # Clear index
-        self._trajectory_index.clear()
-        self._trajectory_id_list.clear()
-        self._trajectory_file_path.clear()
+        # Clear index (under lock so concurrent reads see consistent state).
+        with self._index_lock:
+            self._trajectory_index.clear()
+            self._trajectory_id_list.clear()
+            self._trajectory_file_path.clear()
+            # CRIT-R4-4: durable-id set MUST be reset together with the
+            # in-memory index, otherwise the next `_save_metadata` writes
+            # `size=len(stale_durable)` while `_save_trajectory_index` writes
+            # an empty index — persistence becomes inconsistent.
+            self._durable_trajectory_ids.clear()
+            # Reset state
+            self.size = 0
+            self._total_samples = 0
+            self._trajectory_counter = 0
 
-        # Clear cache
+        # Clear cache (no lock needed; cache has its own protection).
         if self._flat_trajectory_cache is not None:
             self._flat_trajectory_cache.clear()
-
-        # Reset state
-        self.size = 0
-        self._total_samples = 0
-        self._trajectory_counter = 0
 
     def get_stats(self) -> dict[str, float]:
         """Get buffer statistics."""
@@ -931,6 +1272,12 @@ class TrajectoryReplayBuffer:
         os.makedirs(save_path, exist_ok=True)
 
         save_futures = []
+        # MAJ-R4-1: collect exactly the IDs whose payload was copied/written
+        # under ``save_path`` and pass that set to _save_metadata /
+        # _save_trajectory_index. Otherwise persisted metadata references
+        # the full durable set, including trajectories whose ``.pt`` was
+        # never copied into the checkpoint directory.
+        copied_ids: set[int] = set()
         if not self.auto_save:
             cache = self._flat_trajectory_cache
             if cache is None:
@@ -968,6 +1315,7 @@ class TrajectoryReplayBuffer:
                         save_dir=save_path,
                     )
                 )
+                copied_ids.add(trajectory_id)
         else:
             for trajectory_id in self._window_cache_ids:
                 model_weights_id = self._trajectory_index[trajectory_id][
@@ -986,13 +1334,16 @@ class TrajectoryReplayBuffer:
                         shutil.copyfile, trajectory_path, target_path
                     )
                 )
+                copied_ids.add(trajectory_id)
 
         for fut in save_futures:
             fut.result()
 
-        # Save metadata and trajectory index into the specified directory
-        self._save_metadata(save_path)
-        self._save_trajectory_index(save_path)
+        # Save metadata and trajectory index scoped to the actually-copied
+        # IDs so the persisted checkpoint doesn't reference files that
+        # don't exist under ``save_path``.
+        self._save_metadata(save_path, included_ids=copied_ids)
+        self._save_trajectory_index(save_path, included_ids=copied_ids)
 
     def load_checkpoint(
         self,
@@ -1102,11 +1453,36 @@ class TrajectoryReplayBuffer:
             self._total_samples = metadata.get("total_samples", 0)
             self._trajectory_counter = metadata.get("trajectory_counter", 0)
 
+        # Replace (not union) the durable set with EXACTLY the loaded IDs.
+        # Using `update()` here would leak stale IDs from a previous
+        # checkpoint on a reused buffer instance — `_save_metadata` would
+        # then publish trajectories whose payload files were never copied
+        # to the new ``load_path``. We also verify each expected file
+        # exists; missing files would otherwise become "durable" liars.
+        verified_ids: set[int] = set()
+        for tid in self._trajectory_id_list:
+            info = self._trajectory_index.get(tid)
+            if info is None:
+                continue
+            payload_path = self._get_trajectory_path(
+                tid, info.get("model_weights_id", ""), base_dir=load_path
+            )
+            if os.path.exists(payload_path):
+                verified_ids.add(tid)
+        with self._index_lock:
+            self._durable_trajectory_ids = verified_ids
+
         if self._flat_trajectory_cache is not None:
             self._flat_trajectory_cache.clear()
             if self._trajectory_id_list:
                 max_cache = self._flat_trajectory_cache.max_size
-                recent_ids = self._trajectory_id_list[-max_cache:]
+                # CRIT-R8: filter to verified ids before warming the cache.
+                # Otherwise an orphan id (file missing) would crash with
+                # FileNotFoundError during _load_trajectory below.
+                eligible = [
+                    tid for tid in self._trajectory_id_list if tid in verified_ids
+                ]
+                recent_ids = eligible[-max_cache:]
                 for trajectory_id in recent_ids:
                     model_weights_id = self._trajectory_index[trajectory_id][
                         "model_weights_id"

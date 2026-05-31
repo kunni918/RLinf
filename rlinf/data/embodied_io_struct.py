@@ -587,20 +587,36 @@ class EmbodiedRolloutResult:
 
         if loss_mask.dim() == 1:
             loss_mask = loss_mask[:, None]
-        assert loss_mask.dim() == 2, f"Expected 2D tensor, got {loss_mask.shape=}"
+        if loss_mask.dim() != 2:
+            raise ValueError(
+                f"loss_mask must be 1D or 2D; got shape {tuple(loss_mask.shape)}."
+            )
 
         bool_mask = loss_mask.to(torch.bool).cpu().contiguous()
+        # Reject inconsistent trailing chunk dim across calls — without this,
+        # an early-break in run_realworld_chunk_step can produce a final mask
+        # with fewer trailing entries than earlier steps, and the per-step
+        # torch.stack in to_trajectory then dies with an opaque error.
+        if self.loss_mask:
+            prior_trailing = self.loss_mask[-1].shape[-1]
+            if bool_mask.shape[-1] != prior_trailing:
+                raise ValueError(
+                    f"loss_mask trailing dim {bool_mask.shape[-1]} does not "
+                    f"match prior step trailing dim {prior_trailing}; "
+                    "producers must emit a consistent chunk_steps trailing dim."
+                )
         if len(self.loss_mask) == len(self.actions):
             # Called again on the same step (e.g. from the rollout loop and from
             # _update_last_actions_from_env_output on the next iteration).
             self.loss_mask[-1] = bool_mask
+        elif len(self.loss_mask) == len(self.actions) - 1:
+            self.loss_mask.append(bool_mask)
         else:
-            assert len(self.loss_mask) == len(self.actions) - 1, (
+            raise ValueError(
                 f"loss_mask length {len(self.loss_mask)} is out of sync with "
                 f"actions length {len(self.actions)}; producers must mark "
                 "loss_mask consistently on every step."
             )
-            self.loss_mask.append(bool_mask)
 
     def update_last_actions(
         self, intervene_actions: torch.Tensor, intervene_flags: torch.Tensor
@@ -782,9 +798,27 @@ class EmbodiedRolloutResult:
 
 def convert_trajectories_to_batch(
     trajectories: list[Trajectory],
+    *,
+    strict_forward_inputs: bool = False,
 ) -> dict[str, torch.Tensor]:
-    """
-    convert a list of trajectories to a batch dict, the shape of the batch is [T, B, ...].
+    """Convert a list of trajectories to a batch dict, shape ``[T, B, ...]``.
+
+    Args:
+        trajectories: Per-rollout trajectories produced by env/rollout workers
+            or LeRobot demo conversion.
+        strict_forward_inputs: When ``True``, require ``forward_inputs`` schemas
+            to be uniform across the batch (the old hard-fail behaviour).  The
+            default is ``False`` because LeRobot demos always carry
+            ``forward_inputs={"action": ...}`` whereas other producers may
+            legitimately omit it; the lenient path uses the union of keys and
+            keeps trajectories aligned on the batch dimension.
+
+    Raises:
+        ValueError: If ``curr_obs``/``next_obs`` schemas disagree across the
+            batch, or if any tensor field is present in some trajectories but
+            missing (``None``) in others.  The latter avoids silent batch-size
+            mismatch when, for example, only a subset of trajectories has
+            ``loss_mask`` populated.
     """
     if not trajectories:
         return {}
@@ -804,8 +838,12 @@ def convert_trajectories_to_batch(
                     f"extra_keys={extra}."
                 )
 
-    for nested_field_name in ("curr_obs", "next_obs", "forward_inputs"):
+    # curr_obs / next_obs must be uniform across the batch (observation schema
+    # mismatch is a real bug).  forward_inputs is opt-in (see docstring).
+    for nested_field_name in ("curr_obs", "next_obs"):
         _validate_uniform_keys(nested_field_name)
+    if strict_forward_inputs:
+        _validate_uniform_keys("forward_inputs")
 
     # -------- obs / forward_inputs: dict[str, Tensor] --------
     if trajectories[0].curr_obs:
@@ -832,31 +870,127 @@ def convert_trajectories_to_batch(
             if tensors:
                 batch["next_obs"][key] = torch.cat(tensors, dim=1)
 
-    if trajectories[0].forward_inputs:
-        all_keys: set[str] = set()
-        for traj in trajectories:
-            all_keys.update(traj.forward_inputs.keys())
-        batch["forward_inputs"] = {}
-        for key in all_keys:
-            tensors = [
-                traj.forward_inputs[key]
-                for traj in trajectories
-                if key in traj.forward_inputs
+    # forward_inputs is concatenated via the union of keys. To avoid silent
+    # batch-dim corruption (per-key B different from actions / curr_obs / etc.),
+    # we require every key to be present in every trajectory that carries
+    # ANY forward_inputs. When some trajectories have no forward_inputs at
+    # all and others do, we cannot infer a safe default, so we raise.
+    forward_inputs_keys: set[str] = set()
+    trajectories_with_forward = []
+    for index, traj in enumerate(trajectories):
+        if traj.forward_inputs:
+            forward_inputs_keys.update(traj.forward_inputs.keys())
+            trajectories_with_forward.append(index)
+    if forward_inputs_keys:
+        if len(trajectories_with_forward) != len(trajectories):
+            empty_indices = [
+                i for i in range(len(trajectories))
+                if i not in trajectories_with_forward
             ]
-            if tensors:
-                batch["forward_inputs"][key] = torch.cat(tensors, dim=1)
+            raise ValueError(
+                "Trajectory forward_inputs is set on some trajectories but "
+                f"empty on others (empty indices: {empty_indices}). Mixed "
+                "presence silently misaligns the batch dimension; populate "
+                "forward_inputs on every trajectory or none."
+            )
+        batch["forward_inputs"] = {}
+        for key in forward_inputs_keys:
+            missing_in = [
+                i for i, traj in enumerate(trajectories)
+                if key not in traj.forward_inputs
+            ]
+            if missing_in:
+                raise ValueError(
+                    f"Trajectory forward_inputs['{key}'] is present on some "
+                    f"trajectories but missing on others (missing trajectory "
+                    f"indices: {missing_in}). All trajectories must carry "
+                    "the same forward_inputs keys."
+                )
+            batch["forward_inputs"][key] = torch.cat(
+                [traj.forward_inputs[key] for traj in trajectories], dim=1
+            )
 
     # -------- tensor fields --------
+    # Scan ALL trajectories (not just trajectory 0) so we don't miss tensor
+    # fields that are None on the first trajectory but present later.
+    tensor_field_presence: dict[str, list[bool]] = {}
     reference_trajectory = trajectories[0]
     for field_name in reference_trajectory.__dataclass_fields__.keys():
-        if not isinstance(getattr(reference_trajectory, field_name), torch.Tensor):
+        # Skip nested dict fields handled above and scalar metadata fields.
+        if field_name in ("curr_obs", "next_obs", "forward_inputs"):
             continue
-        field_list = [
-            getattr(traj, field_name)
+        any_present = any(
+            isinstance(getattr(traj, field_name), torch.Tensor)
             for traj in trajectories
-            if getattr(traj, field_name) is not None
+        )
+        if not any_present:
+            continue
+        tensor_field_presence[field_name] = [
+            getattr(traj, field_name) is not None for traj in trajectories
         ]
-        if field_list:
-            batch[field_name] = torch.cat(field_list, dim=1)
+
+    # Some tensor fields legitimately appear on only one side (e.g. LeRobot
+    # demos always emit ``loss_mask``; pre-existing rollouts/checkpoints may
+    # not). For those fields we fill missing entries with a documented
+    # default (loss_mask → all-True, "count every sample") rather than
+    # raising, otherwise mixing legacy data with new demos crashes.
+    _fillable_field_defaults = {
+        "loss_mask": {"value": True, "dtype": torch.bool},
+    }
+    for field_name, presence in tensor_field_presence.items():
+        if not all(presence):
+            if field_name not in _fillable_field_defaults:
+                missing_indices = [i for i, p in enumerate(presence) if not p]
+                raise ValueError(
+                    f"Trajectory tensor field '{field_name}' is present on "
+                    f"some trajectories but missing on others (missing "
+                    f"trajectory indices: {missing_indices}). Mixed presence "
+                    "silently misaligns the batch dimension; ensure every "
+                    "trajectory carries the field or omit it from all of "
+                    "them."
+                )
+            spec = _fillable_field_defaults[field_name]
+            # Trailing shape (everything after the [T, B] prefix) comes from
+            # any trajectory that DOES carry the field — those dims are
+            # uniform across the dataset (e.g. ``num_action_chunks``).  The
+            # leading [T, B] prefix MUST come from the missing trajectory
+            # itself; otherwise we'd fill with the wrong T or B and silently
+            # misalign the batch.  We look up that trajectory's actions
+            # tensor (always present) to derive the prefix.
+            reference = next(
+                getattr(traj, field_name)
+                for traj, present in zip(trajectories, presence)
+                if present
+            )
+            trailing_shape = tuple(reference.shape[2:])
+            field_list = []
+            for traj, present in zip(trajectories, presence):
+                if present:
+                    field_list.append(getattr(traj, field_name))
+                else:
+                    own_shape_source = getattr(traj, "actions", None)
+                    if own_shape_source is None or own_shape_source.ndim < 2:
+                        raise ValueError(
+                            f"Cannot fill missing tensor field "
+                            f"'{field_name}' on a trajectory without an "
+                            "'actions' tensor: no way to infer the [T, B] "
+                            "prefix safely."
+                        )
+                    fill_shape = (
+                        int(own_shape_source.shape[0]),
+                        int(own_shape_source.shape[1]),
+                        *trailing_shape,
+                    )
+                    field_list.append(
+                        torch.full(
+                            fill_shape,
+                            fill_value=spec["value"],
+                            dtype=spec.get("dtype", reference.dtype),
+                            device=reference.device,
+                        )
+                    )
+        else:
+            field_list = [getattr(traj, field_name) for traj in trajectories]
+        batch[field_name] = torch.cat(field_list, dim=1)
 
     return batch

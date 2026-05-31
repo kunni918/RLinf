@@ -25,12 +25,19 @@ Quick Start
 Common Parameters
 -----------------
 
-- `auto_save_path`: trajectory storage directory when auto_save is enabled; defaults to the log directory if not specified.
+- `auto_save_path`: trajectory storage directory when ``auto_save=True``.
+  This argument is **required** when ``auto_save=True`` — the constructor
+  asserts that it is non-empty
+  (`rlinf/data/replay_buffer.py:270-279`). There is no fallback to the log
+  directory.
 - `trajectory_format`: `pt` (default) or `pkl`.
 - `enable_cache` / `cache_size`: enable cache and set its size for throughput.
 - `sample_window_size`: sample from the most recent N trajectories; 0 means all.
-- `auto_save`: whether to persist to disk; `False` keeps cache and saves on checkpoint.
-  disables checkpoints.
+- `auto_save`: whether to persist new trajectories to disk **incrementally**
+  inside ``add_trajectories``. When ``False``, the constructor force-enables
+  the in-memory cache (sized to ``sample_window_size``) so trajectories are
+  not lost. Explicit ``save_checkpoint()`` calls are **independent** of this
+  flag and continue to work regardless of ``auto_save``.
 
 Add Trajectories
 ----------------
@@ -89,7 +96,28 @@ roots, convert it first:
 
    python -m rlinf.data.lerobot_replay_buffer \
      --dataset-path /path/to/lerobot_dataset \
-     --save-path /path/to/replay_buffer_demo
+     --save-path /path/to/replay_buffer_demo \
+     --num-action-chunks <actor.model.num_action_chunks>
+
+.. warning::
+
+   ``--num-action-chunks`` MUST match the training config's
+   ``actor.model.num_action_chunks``. The persisted ``loss_mask`` trailing
+   dim derives from this flag; a mismatch causes the strict
+   ``concat_batch`` mode to reject demo + rollout mixing at training time.
+   The flag defaults to ``1`` for backward compatibility, which only works
+   for single-chunk SAC configs.
+
+.. warning::
+
+   **Image channel order: RGB only.** The converter's bytes / path / PIL
+   code paths emit RGB via ``PIL.Image.convert("RGB")``. Raw numpy /
+   torch tensor cells are accepted **as-is and assumed RGB**; the
+   converter cannot detect BGR from a uint8 array. If your collector
+   (e.g. OpenCV / RealWorld cameras that natively output BGR) writes raw
+   arrays into LeRobot frames, convert BGR → RGB BEFORE passing data to
+   ``CollectEpisode`` / the converter, or your demo buffer will silently
+   train on color-swapped images.
 
 The converter decodes image columns that contain arrays, PIL images, encoded
 ``bytes`` payloads, or paths relative to the local LeRobot dataset root. If an
@@ -105,6 +133,7 @@ SAC/RLPD configs such as ``cnn_policy`` or image ``flow_policy`` configs:
    python -m rlinf.data.lerobot_replay_buffer \
      --dataset-path /path/to/collected_data \
      --save-path /path/to/replay_buffer_demo \
+     --num-action-chunks <actor.model.num_action_chunks> \
      --state-only
 
 Then replace ``load_path`` in an existing RLPD/SAC ``demo_buffer`` block:
@@ -126,15 +155,52 @@ RLinf LeRobot collection writes each action frame with explicit ``next_state`` /
 ``truncated``, and intervention flags stay aligned with the source action. Legacy
 datasets without explicit next observations must include an observation-only
 final frame; otherwise the converter fails fast instead of silently dropping the
-last action. The converter validates ``done == terminated or truncated`` when
-split flags are present. Multi-view columns such as ``wrist_image-0`` and
-``extra_view_image-1`` are stacked into canonical replay keys.
+last action.
+
+**Terminal-flag contract.** The converter
+(``_validate_terminal_frame_flags`` in ``rlinf/data/lerobot_replay_buffer.py``) enforces a strict
+contract on terminal frames:
+
+- When both ``terminated`` and ``truncated`` columns are present, the
+  converter raises if they are **both true** in the same frame
+  (gymnasium spec: terminal end vs. truncated horizon are mutually
+  exclusive).
+- ``done`` must agree with ``terminated or truncated`` whenever both
+  ``done`` and the split flags are provided; mismatches raise instead
+  of silently picking one source.
+- On the final action frame, partial / incomplete terminal metadata
+  (e.g. ``done`` missing while either of ``terminated`` / ``truncated``
+  is present and inconclusive) is rejected so that the implicit
+  ``default_done`` fallback can never override an explicit, ambiguous
+  source. Set ``done``, or provide split flags that determine ``done``,
+  to make the final transition unambiguous.
+
+Multi-view columns such as ``wrist_image-0`` and ``extra_view_image-1`` are
+stacked into canonical replay keys.
 
 By default ``demo_buffer.load_mode: shard`` splits loaded demos across actor
 ranks. If the converted demo buffer is smaller than the actor world size, use
-``load_mode: replicate`` so every actor rank loads the full demo buffer. This is
-data plumbing for replay/demo-buffer initialization; it is not a full HIL-SERL
-reproduction or a claim about training performance.
+``load_mode: replicate`` so every actor rank loads the full demo buffer.
+
+.. warning::
+
+   **Per-rank ``min_buffer_size`` caveat (shard mode).** Under
+   ``load_mode: shard``, each actor rank receives roughly
+   ``floor(N / world_size)`` trajectories
+   (``TrajectoryReplayBuffer.load_checkpoint`` splits the trajectory
+   list by ``local_rank`` / ``world_size``). The post-load validator
+   (``validate_loaded_demo_buffer`` in
+   ``rlinf/workers/actor/sac_demo_buffer_utils.py``) then hard-fails on
+   any rank whose shard has fewer than
+   ``algorithm.demo_buffer.min_buffer_size`` trajectories. Concretely,
+   if you converted ``N`` demos and run with ``world_size`` actor ranks,
+   keep ``min_buffer_size <= floor(N / world_size)``. If you cannot
+   collect enough demos to satisfy that on every rank, either lower
+   ``min_buffer_size`` or switch to ``load_mode: replicate`` so every
+   rank sees the full ``N`` trajectories.
+
+This is data plumbing for replay/demo-buffer initialization; it is not a full
+HIL-SERL reproduction or a claim about training performance.
 
 CLI Test
 --------
@@ -304,9 +370,91 @@ View Different Camera Angles
 Notes
 ~~~~~
 
-- The tool uses ``TrajectoryReplayBuffer.load_checkpoint()`` to read metadata and index files
-- Trajectories are loaded lazily on-demand using ``_load_trajectory()``
-- Cache size is set to 5 trajectories to balance memory and performance
-- When you press ``→`` at the last frame of trajectory i, it automatically jumps to frame 0 of trajectory i+1
-- When you press ``←`` at the first frame of trajectory i, it automatically jumps to the last frame of trajectory i-1
-- Image files are saved at 150 DPI for good quality while keeping file size reasonable
+- The tool uses ``TrajectoryReplayBuffer.load_checkpoint()`` to read metadata and index files.
+- Trajectories are loaded lazily on-demand using the public
+  ``load_trajectory(trajectory_id, model_weights_id)`` method; metadata is
+  iterated via ``iter_trajectory_metadata()`` / ``get_trajectory_info(id)``,
+  and the live id list comes from ``list_trajectory_ids()``. Do NOT
+  reach into the private ``_trajectory_*`` attributes — they are not
+  part of the public surface.
+- Cache size is set to 5 trajectories to balance memory and performance.
+- When you press ``→`` at the last frame of trajectory i, it automatically jumps to frame 0 of trajectory i+1.
+- When you press ``←`` at the first frame of trajectory i, it automatically jumps to the last frame of trajectory i-1.
+- Image files are saved at 150 DPI for good quality while keeping file size reasonable.
+
+Public Replay-Buffer API
+~~~~~~~~~~~~~~~~~~~~~~~~
+
+External tools (visualizers, validators, ad-hoc scripts) should use the
+following public methods on ``TrajectoryReplayBuffer``:
+
+- ``list_trajectory_ids() -> list[int]`` — snapshot of trajectory ids in
+  insertion order, taken under the index lock.
+- ``iter_trajectory_metadata()`` — yields ``(trajectory_id,
+  model_weights_id, num_samples)`` tuples without loading any payload.
+- ``get_trajectory_info(trajectory_id) -> dict`` — returns the stored
+  metadata dict (``model_weights_id``, ``num_samples``, ``shape``).
+- ``load_trajectory(trajectory_id, model_weights_id) -> Trajectory`` —
+  public wrapper around the on-disk load path.
+
+Durability and resume safety
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+- All persisted state (``metadata.json``, ``trajectory_index.json``,
+  ``trajectory_*.pt``, ``.pkl``) is written via a temp file +
+  ``os.fsync`` + ``os.replace`` so a Ctrl-C / SIGKILL / OOM mid-write
+  cannot leave a half-written checkpoint at the final path.
+- The persisted index references ONLY trajectories whose payload file is
+  durable on disk. A concurrent ``add_trajectories`` whose ``.pt`` is
+  still being written is excluded from the index until the save
+  completes — resume will never load metadata that points at a missing
+  file.
+- ``close(wait=True)`` drains every pending save / metadata-flush future
+  and re-raises the first error. CLIs / collectors MUST call
+  ``buffer.close()`` (or wrap with ``try/finally``) so async persistence
+  failures aren't silently swallowed.
+
+LeRobot writer schema modes
+~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+``LeRobotDatasetWriter.create()`` exposes a ``transition_schema`` kwarg
+that selects between two field sets:
+
+- ``transition_schema=False`` (default — backward compatible): emits the
+  minimal LeRobot schema (``state``, ``actions``, ``done``,
+  ``is_success``, ``image``, ``intervene_flag``,
+  ``observation.task_description``).
+- ``transition_schema=True``: also emits ``next_state``, ``next_image``
+  (and ``next_<wrist/extra_view>_image`` when configured), ``rewards``,
+  ``terminated``, ``truncated``. This is the schema required by the
+  RLPD/SAC demo-buffer pipeline; ``CollectEpisode`` opts in
+  automatically.
+
+If you build a custom writer for a non-RLinf consumer, leave
+``transition_schema=False`` to preserve the legacy column set. Older
+code that called ``LeRobotDatasetWriter.create(features=None)`` and
+implicitly received the transition-rich schema MUST switch to passing
+``transition_schema=True`` to keep that behavior.
+
+SAC FSDP collective contract
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+The SAC actor worker (``EmbodiedSACFSDPPolicy``) gates several
+collective-relevant decisions on a GLOBAL (all-reduced) view so every
+rank takes the same branch and the FSDP process group does not deadlock:
+
+- Replay-buffer / demo-buffer readiness is decided via global AND
+  (``_global_all_ranks``). A single rank with a short shard skips the
+  whole training step on every rank.
+- ``clip_grad_norm_``, ``optimizer.step``, ``scheduler.step``, the
+  alpha all-reduce, and the soft target-network update are gated on
+  ``_global_valid_count``. Ranks with locally zero valid samples still
+  enter ``backward()`` (via a graph-connected zero loss) so FSDP
+  collectives remain consistent, but they do NOT advance the LR
+  schedule when the global valid count is zero.
+- The all-zero / partial mask paths sanitize NaN/Inf in
+  ``per_sample_loss`` before reduction so a single rank's bad value
+  cannot poison every rank via FSDP's grad averaging.
+- The per-rank loss is scaled by ``world_size / global_valid_count`` so
+  that FSDP's grad averaging recovers the global unweighted mean
+  regardless of how unevenly valid samples are distributed.

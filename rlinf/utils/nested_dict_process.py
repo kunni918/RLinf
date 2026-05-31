@@ -103,12 +103,145 @@ def split_dict_to_chunk(data: dict, split_size, dim=0):
     return splited_list
 
 
-def concat_batch(data1, data2):
+# Tensor keys for which a missing side in strict-mode concat is auto-filled
+# with a documented default rather than raising. ``loss_mask`` is the one
+# field that legitimately appears on only one side (e.g. LeRobot demos always
+# emit it; pre-existing rollouts may not) and where a default ("count every
+# sample") is unambiguous.
+_CONCAT_BATCH_FILLABLE_DEFAULTS: dict[str, dict] = {
+    "loss_mask": {"value": True, "dtype": torch.bool},
+}
+
+# Dict-valued keys that are documented as opt-in (asymmetric presence is
+# legitimate) and therefore exempt from the symmetric dict-key check in
+# strict mode. ``forward_inputs`` is opt-in: LeRobot demos always populate
+# ``{"action": ...}`` while many rollouts emit an empty dict that
+# ``convert_trajectories_to_batch`` then omits entirely.
+_CONCAT_BATCH_LENIENT_DICT_KEYS: frozenset = frozenset({"forward_inputs"})
+
+
+def _peer_batch_dim(side: dict) -> int | None:
+    """Return the leading (batch) dim of any tensor on ``side`` (or None).
+
+    Used when auto-filling a fillable tensor key on the side that lacks it:
+    the trailing shape comes from the OTHER side's value, but the leading
+    batch dim must match this side's existing tensors so the cat stays
+    consistent.
+    """
+    for value in side.values():
+        if isinstance(value, torch.Tensor):
+            return value.shape[0]
+    return None
+
+
+def _fill_missing_tensor_default(
+    reference: torch.Tensor, spec: dict, *, batch_dim: int | None = None
+) -> torch.Tensor:
+    """Create a fill tensor matching ``reference``'s trailing shape.
+
+    The leading batch dim is ``batch_dim`` when provided (so the missing
+    side's batch size aligns with its other tensors) and ``reference``'s
+    dim 0 otherwise.
+    """
+    dtype = spec.get("dtype", reference.dtype)
+    shape = list(reference.shape)
+    if batch_dim is not None:
+        shape[0] = batch_dim
+    return torch.full(
+        shape,
+        fill_value=spec["value"],
+        dtype=dtype,
+        device=reference.device,
+    )
+
+
+def concat_batch(data1, data2, *, strict: bool = True):
+    """Concatenate two batch dicts along the batch (dim=0) dimension.
+
+    Args:
+        data1: First batch dict.  Iteration drives which keys are emitted.
+        data2: Second batch dict.  Must contain the same tensor keys as
+            ``data1`` when ``strict=True`` (with the exception of the
+            documented fillable keys in
+            :data:`_CONCAT_BATCH_FILLABLE_DEFAULTS`, currently
+            ``loss_mask`` — missing side is auto-filled with an
+            all-true mask rather than raising, so mixing legacy rollouts
+            with new LeRobot demos still works).
+        strict: When ``True`` (default), raise ``ValueError`` whenever a
+            tensor key in ``data1`` is missing from ``data2`` (and vice
+            versa) UNLESS the key is fillable.  When ``False``, falls back
+            to legacy behaviour that skips missing keys (with a one-time
+            warning per key for dict values).
+
+    Raises:
+        ValueError: If ``strict`` is ``True`` and the two dicts disagree on
+            a non-fillable tensor key at any nesting level.
+    """
     batch = {}
+    # Strict check: BOTH tensor keys and dict keys (e.g. ``forward_inputs``)
+    # in either side must be present in both, or be in the fillable set.
+    # The earlier check covered only tensor keys, so a ``forward_inputs``
+    # dict present on only one side could silently disappear under
+    # ``strict=True`` (CRIT-R4-5).
+    if strict:
+        tensor_keys_1 = {
+            key for key, value in data1.items() if isinstance(value, torch.Tensor)
+        }
+        tensor_keys_2 = {
+            key for key, value in data2.items() if isinstance(value, torch.Tensor)
+        }
+        dict_keys_1 = {
+            key for key, value in data1.items() if isinstance(value, dict)
+        }
+        dict_keys_2 = {
+            key for key, value in data2.items() if isinstance(value, dict)
+        }
+        fillable = set(_CONCAT_BATCH_FILLABLE_DEFAULTS.keys())
+        # ``forward_inputs`` (and any future opt-in dict) is exempt from the
+        # symmetric check; the remaining ``curr_obs`` / ``next_obs`` cases
+        # MUST be uniform or silent observation-schema drift becomes
+        # possible.
+        missing_in_data2 = sorted(tensor_keys_1 - tensor_keys_2 - fillable)
+        missing_in_data1 = sorted(tensor_keys_2 - tensor_keys_1 - fillable)
+        dict_missing_in_data2 = sorted(
+            (dict_keys_1 - dict_keys_2) - _CONCAT_BATCH_LENIENT_DICT_KEYS
+        )
+        dict_missing_in_data1 = sorted(
+            (dict_keys_2 - dict_keys_1) - _CONCAT_BATCH_LENIENT_DICT_KEYS
+        )
+        if (
+            missing_in_data2
+            or missing_in_data1
+            or dict_missing_in_data2
+            or dict_missing_in_data1
+        ):
+            raise ValueError(
+                "concat_batch: keys disagree between the two batches "
+                "(data1 / data2 are the two arguments passed to concat_batch); "
+                f"tensor keys only in data1={missing_in_data2}, "
+                f"tensor keys only in data2={missing_in_data1}, "
+                f"dict keys only in data1={dict_missing_in_data2}, "
+                f"dict keys only in data2={dict_missing_in_data1}. "
+                "Producers must emit the same set of keys on both sides, or "
+                "extend _CONCAT_BATCH_FILLABLE_DEFAULTS if a missing key has "
+                "a safe documented default. (Passing strict=False silently "
+                "drops missing keys and is only for legacy code paths.)"
+            )
+
     for key, value in data1.items():
         if isinstance(value, torch.Tensor):
             if key not in data2:
-                # NOTE: NO WARNING FOR THE CASE THAT DATA2 DOES NOT CONTAIN SOME KEYS IN DATA1
+                if strict and key in _CONCAT_BATCH_FILLABLE_DEFAULTS:
+                    # Auto-fill data2's missing side with a tensor whose
+                    # batch dim matches data2's peer tensors and whose
+                    # trailing dims match data1's reference shape.
+                    fill = _fill_missing_tensor_default(
+                        value,
+                        _CONCAT_BATCH_FILLABLE_DEFAULTS[key],
+                        batch_dim=_peer_batch_dim(data2),
+                    )
+                    batch[key] = torch.cat([value, fill], dim=0)
+                # Otherwise (strict=False) silently skip.
                 continue
             batch[key] = torch.cat([data1[key], data2[key]], dim=0)
         elif isinstance(value, dict):
@@ -129,7 +262,22 @@ def concat_batch(data1, data2):
                         type(value).__name__,
                     )
                 continue
-            batch[key] = concat_batch(data1[key], data2[key])
+            batch[key] = concat_batch(data1[key], data2[key], strict=strict)
+
+    # Symmetric pass for fillable tensor keys that exist only in data2.
+    if strict:
+        for key, value in data2.items():
+            if (
+                isinstance(value, torch.Tensor)
+                and key not in data1
+                and key in _CONCAT_BATCH_FILLABLE_DEFAULTS
+            ):
+                fill = _fill_missing_tensor_default(
+                    value,
+                    _CONCAT_BATCH_FILLABLE_DEFAULTS[key],
+                    batch_dim=_peer_batch_dim(data1),
+                )
+                batch[key] = torch.cat([fill, value], dim=0)
     return batch
 
 

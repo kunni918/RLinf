@@ -209,16 +209,36 @@ class WorkerGroup(Generic[WorkerClsType]):
         return self
 
     def _close(self):
-        """Close the worker group and release resources. This method is called when the worker group is no longer needed."""
+        """Close the worker group and release resources.
+
+        Every worker MUST be ``ray.kill``-ed even if its ``_close`` hook
+        raises; otherwise a single bad worker (e.g. a hung CollectEpisode
+        finalize) leaves the remaining workers as dangling Ray actors and
+        leaks their resources. We drain everything, collect the first
+        error, and re-raise it after every worker has been killed.
+        """
+        first_error: BaseException | None = None
         for worker_info in self._workers:
-            # Call cleanup methods if they exist
-            if hasattr(worker_info.worker, "_close"):
-                ray.get(worker_info.worker._close.remote())
-            ray.kill(worker_info.worker)
+            try:
+                # Call cleanup methods if they exist.
+                if hasattr(worker_info.worker, "_close"):
+                    ray.get(worker_info.worker._close.remote())
+            except BaseException as exc:  # noqa: BLE001 — drain everything
+                if first_error is None:
+                    first_error = exc
+            # ray.kill must run for EVERY worker so we don't leak actors
+            # if the _close hook raised.
+            try:
+                ray.kill(worker_info.worker)
+            except BaseException as exc:  # noqa: BLE001
+                if first_error is None:
+                    first_error = exc
         self._workers.clear()
         self._cluster = None
         self._placement_strategy = None
         self._execution_ranks = None
+        if first_error is not None:
+            raise first_error
 
     def _create_workers(self):
         """Create workers in the group, each worker is placed on a different GPU."""

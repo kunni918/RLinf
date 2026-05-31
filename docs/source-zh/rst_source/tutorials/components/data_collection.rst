@@ -43,6 +43,15 @@ Episode 数据采集
   会自动按索引展开成 ``wrist_image-0``、``extra_view_image-0`` …… 等列。
 - ``only_success=True`` 可过滤失败 episode，节省磁盘空间。
 
+.. warning::
+
+   **图像通道顺序：仅支持 RGB**。``CollectEpisode`` 把环境给的原始图像
+   数组直接写入 LeRobot frame；后续 LeRobot → replay-buffer 转换器对
+   这些数组 **按原样接收并默认 RGB**。如果你的环境暴露的是 BGR
+   （OpenCV / 默认输出 BGR 的 RealWorld 相机），必须在 obs 进入 env
+   之前自行 BGR → RGB，否则持久化的 demo buffer 将以颜色错位的图像
+   训练。运行时无法检测通道顺序，这是契约。
+
 构造参数
 ~~~~~~~~
 
@@ -181,21 +190,34 @@ Episode 数据采集
 
 **LeRobot 格式**
 
-数据以 Parquet 文件存储，并附带 JSON 元数据，目录结构如下：
+数据以 Parquet 文件存储，并附带 JSON 元数据。``CollectEpisode`` wrapper
+会按 worker 和写入批次在
+``save_dir/rank_{rank}/id_{episodes_written}/`` 下分别创建独立的
+LeRobot dataset root：
 
 .. code-block:: text
 
    save_dir/
-   ├── meta/
-   │   ├── info.json           # 数据集元信息（fps、robot_type、维度等）
-   │   ├── episodes.jsonl      # 每条 episode 的长度与任务描述
-   │   ├── tasks.jsonl         # 去重后的任务列表
-   │   └── stats.json          # 观测、动作的均值/方差统计
-   └── data/
-       └── chunk-000/
-           ├── episode_000000.parquet
-           ├── episode_000001.parquet
+   └── rank_0/                   # 每个 worker rank 一个子目录
+       ├── id_0/                 # 每个写入批次一个子目录（受 finalize_interval 控制）
+       │   ├── meta/
+       │   │   ├── info.json           # 数据集元信息（fps、robot_type、维度等）
+       │   │   ├── episodes.jsonl      # 每条 episode 的长度与任务描述
+       │   │   ├── tasks.jsonl         # 去重后的任务列表
+       │   │   └── stats.json          # 观测、动作的均值/方差统计
+       │   └── data/
+       │       └── chunk-000/
+       │           ├── episode_000000.parquet
+       │           ├── episode_000001.parquet
+       │           └── ...
+       └── id_1/                 # 下一批，触发 finalize_interval 后产生
            └── ...
+
+.. note::
+
+   ``rank_*`` 用于区分分布式 / 向量化 rollout 中的不同 writer；
+   ``id_*`` 在每次调用 ``writer.finalize()``（例如每 ``finalize_interval``
+   个 episode）时滚动，因此同一 rank 可能写出多个 LeRobot root。
 
 每个 Parquet 文件的列结构：
 
@@ -321,15 +343,18 @@ wrapper 从 info 字典中按以下优先级推断 episode 是否成功（从最
    * - ``runner.num_data_episodes``
      - ``20``
      - 目标成功轨迹数量，达到后自动停止
-   * - ``cluster.node_groups.hardware.configs.robot_ip``
+   * - ``cluster.node_groups[0].hardware.configs[0].robot_ip``
      - —
-     - Franka 机器人 IP 地址
+     - Franka 机器人 IP 地址。``node_groups`` 与 ``configs`` 都是 YAML 列表，
+       结构详见下文 :ref:`zh-realworld-collect-yaml-shape`。
    * - ``env.eval.use_spacemouse``
      - ``True``
      - 是否启用 SpaceMouse 干预
    * - ``env.eval.no_gripper``
-     - ``False``
-     - 是否使用不带夹爪维度的 6 维真机动作
+     - ``True``\ （key 缺省时 wrapper 默认值；
+       shipped 配置未显式设置）
+     - 是否使用不带夹爪维度的 6 维真机动作。单臂 wrapper 在该项为 True 时
+       会套用 ``GripperCloseEnv``。
    * - ``env.eval.use_gello``
      - ``False``
      - 是否启用 GELLO 遥操作（与 SpaceMouse 互斥）
@@ -343,7 +368,7 @@ wrapper 从 info 字典中按以下优先级推断 episode 是否成功（从最
      - ``1``
      - 持续到达目标位姿多少 step 后判定为成功
    * - ``runner.record_task_description``
-     - ``True``
+     - ``False``\ （与 shipped ``realworld_collect_data.yaml`` 一致）
      - 是否将任务描述写入观测
 
 数据格式
@@ -355,33 +380,51 @@ wrapper 从 info 字典中按以下优先级推断 episode 是否成功（从最
 
    logs/{timestamp}/demos/
 
-``TrajectoryReplayBuffer`` 使用 ``.pt`` 格式存储每条轨迹，每条轨迹包含：
+``TrajectoryReplayBuffer`` 使用 ``.pt`` 格式存储每条轨迹。
+每个 ``.pt`` 文件保存的是 ``Trajectory`` dataclass
+(:class:`rlinf.data.embodied_io_struct.Trajectory`)，序列化的字段都在
+**顶层**，没有 ``"transitions"`` 包裹层：
 
 .. code-block:: python
 
-   {
-       "transitions": {
-           "obs": {
-               "states":      # 机器人状态，shape=[T, 19]（含位姿、力矩等）
-               "main_images"  # 主摄像头图像，shape=[T, 128, 128, 3]，uint8
-           },
-           "next_obs": {
-               "states":      # 下一步状态
-               "main_images"  # 下一步图像
-           },
-           "action":          # 动作，shape=[T, 6]
-           "rewards":         # 奖励，shape=[T, 1]
-           "dones":           # 结束标志，shape=[T, 1]，bool
-           "terminations":    # 终止标志，shape=[T, 1]，bool
-           "truncations":     # 截断标志，shape=[T, 1]，bool
+   # rlinf.data.embodied_io_struct.Trajectory
+   Trajectory(
+       max_episode_length=int,             # 标量
+       model_weights_id=str,               # 由 model 版本派生的 uuid
+       actions=torch.Tensor,               # [T, B, action_dim]（也可能含 chunk 维度）
+       intervene_flags=torch.Tensor,       # [T, B, ...] bool，逐步干预标志
+       rewards=torch.Tensor,               # [T, B, 1]
+       terminations=torch.Tensor,          # [T, B, 1] bool
+       truncations=torch.Tensor,           # [T, B, 1] bool
+       dones=torch.Tensor,                 # [T, B, 1] bool
+       loss_mask=Optional[torch.Tensor],   # 设置时形状为 [T, B, num_action_chunks]
+       forward_inputs=dict,                # 与生产端相关的 forward kwargs
+       curr_obs={                          # 第 t 步的 observation dict
+           "states":      ...,             # 机器人状态，例如 [T, B, 19]
+           "main_images": ...,              # 主摄像头，例如 [T, B, H, W, C] uint8
+           # 其它 observation key（wrist_images、extra_view_images ……）
        },
-       "intervene_flags":     # 全为 1，表示全程人工干预
-   }
+       next_obs={                          # 第 t+1 步的 observation dict
+           "states":      ...,
+           "main_images": ...,
+       },
+   )
 
 .. note::
 
-   ``intervene_flags`` 全部设置为 1，标记该轨迹为专家演示数据，
-   在 RLPD 训练中用于区分在线策略数据与先验数据。
+   ``intervene_flags`` 在 rollout 与持久化 demo trajectory 中含义不同：
+
+   - rollout 阶段（``EmbodiedRolloutResult``）字段为
+     **逐步布尔标志**\ ，来源于 ``info["intervene_flag"]``
+     （例如 SpaceMouse / GELLO 干预路径）。
+   - 在 ``examples/embodiment/collect_real_data.py`` 将成功 trajectory
+     写入 replay buffer 时，会用 ``torch.ones_like(...)`` 把每一步全部
+     **覆盖为 True**\ ，使该 trajectory 在 RLPD / SAC-demo 训练中被
+     视为完全专家数据。这是按算子语义设计的：成功的真机 demo 无论
+     哪些 substep 被操作员介入，都视为专家 teleop。
+
+   若你的训练需要原始逐步标志，请从 ``collect_real_data`` 后处理之前
+   的 rollout-side ``Trajectory`` 读取，而非持久化的 demo buffer。
 
 同时采集 Replay Buffer 与 LeRobot 数据
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -417,15 +460,30 @@ wrapper 从 info 字典中按以下优先级推断 episode 是否成功（从最
       source <path_to_your_venv>/bin/activate
 
 2. 编辑配置文件 ``examples/embodiment/config/realworld_collect_data.yaml``，
-   将 ``ROBOT_IP`` 和 ``TARGET_EE_POSE`` 替换为真实机器人 IP 与目标位姿：
+   将 ``ROBOT_IP`` 和 ``TARGET_EE_POSE`` 替换为真实机器人 IP 与目标位姿。
+
+   .. _zh-realworld-collect-yaml-shape:
+
+   ``cluster.node_groups`` 是 YAML 列表，每个条目的 ``hardware.configs``
+   同样是列表（每台机器人一个条目）。结构要与 shipped
+   ``examples/embodiment/config/realworld_collect_data.yaml`` 一致：
 
    .. code-block:: yaml
 
       cluster:
+        num_nodes: 1
+        component_placement:
+          env:
+            node_group: franka
+            placement: 0
         node_groups:
-          hardware:
-            configs:
-              robot_ip: "192.168.1.100"   # 替换为实际 IP
+          - label: franka
+            node_ranks: 0
+            hardware:
+              type: Franka
+              configs:
+                - robot_ip: "192.168.1.100"   # 替换为实际 IP
+                  node_rank: 0
 
       env:
         eval:
@@ -501,14 +559,23 @@ wrapper 从 info 字典中按以下优先级推断 episode 是否成功（从最
 **LeRobot 数据集**
 
 使用 ``toolkits/lerobot/visualize_lerobot_dataset.py`` 将 LeRobot 数据集
-展开为按 episode 分目录的 ``.jpg`` 图像和 ``.txt`` step 元数据：
+展开为按 episode 分目录的 ``.jpg`` 图像和 ``.txt`` step 元数据。可视化
+工具会直接读取 ``--dataset-path`` 下的 ``meta/info.json``，因此该参数应
+指向 **某个具体的** LeRobot root（``save_dir/rank_*/id_*``），而不是父
+目录 ``collected_data/``：
 
 .. code-block:: bash
 
    python toolkits/lerobot/visualize_lerobot_dataset.py \
-       --dataset-path logs/{timestamp}/collected_data \
-       --output-dir logs/{timestamp}/collected_data_visualized
+       --dataset-path logs/{timestamp}/collected_data/rank_0/id_0 \
+       --output-dir logs/{timestamp}/collected_data_visualized/rank_0_id_0
 
-该工具会读取 ``meta/info.json`` 和各个 ``episode_*.parquet`` 文件，输出类似
+如需查看所有采集 root，可对每个 ``rank_*/id_*`` 目录重复执行（例如用
+shell 循环）。Replay-buffer 转换器则不同，它接受父目录
+``collected_data/`` 作为输入，会自动遍历嵌套的
+``rank_*/id_*/data/**/*.parquet`` root。
+
+该工具会读取指定 root 下的 ``meta/info.json`` 和各个
+``episode_*.parquet`` 文件，输出类似
 ``episode_000000/step_000003_image.jpg`` 与
 ``episode_000000/step_000003.txt`` 的结构，便于快速人工检查。

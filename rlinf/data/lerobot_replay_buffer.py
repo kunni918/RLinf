@@ -47,6 +47,9 @@ _MAIN_IMAGE_KEYS = (
     "observation.image",
     "observation/image",
     "observation.images.front",
+    # CRIT-R4-6: route slash-form to the same target so it isn't silently
+    # dropped after passing the unknown-key guard.
+    "observation/images/front",
 )
 _NEXT_MAIN_IMAGE_KEYS = (
     "next_main_images",
@@ -55,6 +58,7 @@ _NEXT_MAIN_IMAGE_KEYS = (
     "next_observation.image",
     "next_observation/image",
     "next_observation.images.front",
+    "next_observation/images/front",
 )
 _WRIST_IMAGE_KEYS = (
     "wrist_images",
@@ -62,6 +66,7 @@ _WRIST_IMAGE_KEYS = (
     "observation.wrist_image",
     "observation/wrist_image",
     "observation.images.wrist",
+    "observation/images/wrist",
 )
 _NEXT_WRIST_IMAGE_KEYS = (
     "next_wrist_images",
@@ -69,6 +74,7 @@ _NEXT_WRIST_IMAGE_KEYS = (
     "next_observation.wrist_image",
     "next_observation/wrist_image",
     "next_observation.images.wrist",
+    "next_observation/images/wrist",
 )
 _EXTRA_VIEW_IMAGE_KEYS = (
     "extra_view_images",
@@ -185,6 +191,20 @@ def _validate_image_tensor(tensor: torch.Tensor) -> torch.Tensor:
 
 
 def _image_tensor(value: Any, frame: dict[str, Any]) -> torch.Tensor:
+    """Convert a frame image cell to a validated ``[H, W, C]`` tensor.
+
+    Channel-order contract: every code path here produces / expects RGB
+    channel-last layout. Bytes / path / PIL inputs are converted via
+    ``PIL.Image.convert("RGB")``. RAW numpy / torch tensor inputs MUST
+    already be RGB — the converter cannot detect BGR from a raw uint8
+    array and would silently mislabel ``CollectEpisode`` images recorded
+    from BGR cameras (e.g. OpenCV / RealWorld) as RGB.
+
+    Producers writing raw arrays MUST convert before handing data to
+    ``CollectEpisode`` / the LeRobot replay-buffer converter. The
+    documented contract is restated in
+    ``docs/source-en/rst_source/tutorials/components/replay_buffer.rst``.
+    """
     if isinstance(value, dict):
         for key in ("array", "data", "image"):
             if key in value and value[key] is not None:
@@ -223,12 +243,17 @@ def _is_missing_value(value: Any) -> bool:
     if isinstance(value, (str, bytes, bytearray, memoryview, Path)):
         return False
     if isinstance(value, torch.Tensor):
-        if value.ndim == 0:
-            if value.dtype.is_floating_point:
-                return bool(torch.isnan(value).item())
-            return False
+        if value.numel() == 0:
+            return True
+        if value.numel() == 1 and value.dtype.is_floating_point:
+            # Treat scalar / length-1 NaN as missing; finite values are present.
+            return bool(torch.isnan(value.reshape(-1)[0]).item())
         return False
     if isinstance(value, np.ndarray):
+        if value.size == 0:
+            return True
+        if value.size == 1 and np.issubdtype(value.dtype, np.floating):
+            return bool(np.isnan(value.reshape(-1)[0]))
         if value.ndim == 0:
             value = value.item()
         else:
@@ -248,6 +273,63 @@ def _is_missing_value(value: Any) -> bool:
         return bool(np.isnan(value))
     except (TypeError, ValueError):
         return False
+
+
+def _strict_scalar_bool(value: Any, *, field_name: str) -> bool:
+    """Convert a scalar tensor / numpy / Python value to a strict bool.
+
+    Accepts:
+      * Python ``bool`` (or numpy ``bool_``)
+      * Finite numeric values that compare exactly equal to ``0`` or ``1``
+      * Tensors / arrays containing one of the above
+    Rejects:
+      * ``NaN`` / ``+/-Inf``
+      * Non-binary numeric values (``0.5``, ``2``, ``-1``, …)
+
+    This guards against ``bool(0.5)``-style truthy coercion that previously
+    accepted arbitrary numeric data as a true bool.
+    """
+    if isinstance(value, (bool, np.bool_)):
+        return bool(value)
+    # Unwrap 0-d tensor / array to a Python scalar.
+    if isinstance(value, torch.Tensor):
+        if value.numel() != 1:
+            raise ValueError(
+                f"LeRobot {field_name} must be scalar; got shape {tuple(value.shape)}."
+            )
+        if value.dtype == torch.bool:
+            return bool(value.reshape(-1)[0].item())
+        value = value.reshape(-1)[0].item()
+    elif isinstance(value, np.ndarray):
+        if value.size != 1:
+            raise ValueError(
+                f"LeRobot {field_name} must be scalar; got shape {tuple(value.shape)}."
+            )
+        if value.dtype == np.bool_:
+            return bool(value.reshape(-1)[0])
+        value = value.reshape(-1)[0].item()
+    if isinstance(value, (bool, np.bool_)):
+        return bool(value)
+    if isinstance(value, (int, np.integer)):
+        if value not in (0, 1):
+            raise ValueError(
+                f"LeRobot {field_name} must be a binary 0/1 value; got {value}."
+            )
+        return bool(value)
+    if isinstance(value, (float, np.floating)):
+        if not np.isfinite(value):
+            raise ValueError(
+                f"LeRobot {field_name} must be a finite 0/1 value; got {value}."
+            )
+        if value != 0.0 and value != 1.0:
+            raise ValueError(
+                f"LeRobot {field_name} must be exactly 0 or 1; got {value}."
+            )
+        return bool(value)
+    raise ValueError(
+        f"LeRobot {field_name} must be a bool or 0/1 numeric value; got "
+        f"type={type(value).__name__}, value={value!r}."
+    )
 
 
 def _find_value(frame: dict[str, Any], keys: Sequence[str]) -> Any:
@@ -321,18 +403,29 @@ def _has_next_observation(frame: dict[str, Any]) -> bool:
     return _has_value(frame, _NEXT_STATE_KEYS)
 
 
+def _check_finite_nonempty(tensor: torch.Tensor, *, field_name: str) -> torch.Tensor:
+    if tensor.numel() == 0:
+        raise ValueError(f"LeRobot {field_name} is empty (no elements).")
+    if not torch.isfinite(tensor).all():
+        raise ValueError(
+            f"LeRobot {field_name} contains non-finite values (NaN/Inf); "
+            "every element must be finite."
+        )
+    return tensor
+
+
 def _state_tensor(value: Any) -> torch.Tensor:
     tensor = _as_tensor(value, dtype=torch.float32)
     if tensor.ndim == 0:
-        return tensor.reshape(1)
-    if tensor.ndim == 1:
-        return tensor
-    if tensor.ndim == 2 and tensor.shape[0] == 1:
-        return tensor.reshape(-1)
-    raise ValueError(
-        "LeRobot state must be scalar, 1-D, or [1, state_dim]; "
-        f"got shape {tuple(tensor.shape)}."
-    )
+        tensor = tensor.reshape(1)
+    elif tensor.ndim == 2 and tensor.shape[0] == 1:
+        tensor = tensor.reshape(-1)
+    elif tensor.ndim != 1:
+        raise ValueError(
+            "LeRobot state must be scalar, 1-D, or [1, state_dim]; "
+            f"got shape {tuple(tensor.shape)}."
+        )
+    return _check_finite_nonempty(tensor, field_name="state")
 
 
 def _stack_states(
@@ -345,13 +438,15 @@ def _stack_states(
 def _action_tensor(value: Any) -> torch.Tensor:
     tensor = _as_tensor(value, dtype=torch.float32)
     if tensor.ndim == 1:
-        return tensor
-    if tensor.ndim == 2 and tensor.shape[0] == 1:
-        return tensor.reshape(-1)
-    raise ValueError(
-        "LeRobot action must be scalar, 1-D, or [1, action_dim]; "
-        f"got shape {tuple(tensor.shape)}."
-    )
+        pass
+    elif tensor.ndim == 2 and tensor.shape[0] == 1:
+        tensor = tensor.reshape(-1)
+    else:
+        raise ValueError(
+            "LeRobot action must be scalar, 1-D, or [1, action_dim]; "
+            f"got shape {tuple(tensor.shape)}."
+        )
+    return _check_finite_nonempty(tensor, field_name="action")
 
 
 def _stack_actions(frames: Sequence[dict[str, Any]]) -> torch.Tensor:
@@ -473,6 +568,88 @@ def _stack_optional_obs(
     return torch.stack(values, dim=0).unsqueeze(1).contiguous()
 
 
+# Keys that are recognised by the buffer (any observation.images.<name>
+# entry NOT covered below is treated as unknown and rejected, otherwise
+# silently dropped data could go unnoticed).
+_KNOWN_OBSERVATION_IMAGE_KEYS = frozenset(
+    (
+        # Current-step keys.
+        "observation.image",
+        "observation/image",
+        "observation.images.front",
+        "observation.wrist_image",
+        "observation/wrist_image",
+        "observation.images.wrist",
+        "observation.extra_view_image",
+        "observation/extra_view_image",
+        # Next-step keys.
+        "next_observation.image",
+        "next_observation/image",
+        "next_observation.images.front",
+        "next_observation.wrist_image",
+        "next_observation/wrist_image",
+        "next_observation.images.wrist",
+        "next_observation.extra_view_image",
+        "next_observation/extra_view_image",
+    )
+)
+_OBSERVATION_IMAGES_PREFIXES = (
+    "observation.images.",
+    "observation/images/",
+    "next_observation.images.",
+    "next_observation/images/",
+)
+
+# Camera names that ARE routed by ``_MAIN_IMAGE_KEYS`` / ``_WRIST_IMAGE_KEYS``
+# (and the ``next_*`` variants).  The unknown-key guard accepts a key only
+# when its trailing camera name is in this set; otherwise it would silently
+# drop e.g. ``cam_left_wrist`` (substring "wrist") or accept slash-form
+# ``observation/images/front`` even though only the dot-form is actually
+# routed downstream (CRIT-R4-6).
+_RECOGNISED_CAMERA_NAMES = frozenset(("front", "wrist"))
+
+
+def _detect_unknown_camera_keys(
+    frame: dict[str, Any], frame_position: int
+) -> None:
+    """Raise if *frame* exposes ``observation.images.<name>`` keys we don't recognise.
+
+    Currently the converter only routes ``front`` to ``main_images`` and
+    ``wrist`` to ``wrist_images``.  Other camera names (e.g. ``top``,
+    ``cam_left_wrist``) would otherwise be silently dropped, corrupting the
+    replay buffer for multi-camera setups.
+    """
+    unknown_keys = []
+    for key in frame:
+        if not isinstance(key, str):
+            continue
+        if key in _KNOWN_OBSERVATION_IMAGE_KEYS:
+            continue
+        matched_prefix = next(
+            (prefix for prefix in _OBSERVATION_IMAGES_PREFIXES if key.startswith(prefix)),
+            None,
+        )
+        if matched_prefix is None:
+            continue
+        # Only an EXACT trailing ``front``/``wrist`` is a known route — substring
+        # matching would silently accept `cam_left_wrist`, `front_view`, etc.
+        camera_name = key[len(matched_prefix):]
+        if camera_name in ("front", "wrist"):
+            continue
+        unknown_keys.append(key)
+    if unknown_keys:
+        raise ValueError(
+            "LeRobot frame at position "
+            f"{frame_position} contains camera keys the converter does not "
+            f"know how to route: {sorted(unknown_keys)}. The converter only "
+            "recognises 'observation.images.front' (→ main_images) and "
+            "'observation.images.wrist' (→ wrist_images); copy unknown camera "
+            "tensors into 'extra_view_image' (or 'extra_view_images') before "
+            "conversion, or extend the converter to map the additional "
+            "cameras explicitly."
+        )
+
+
 def _build_obs(
     frames: Sequence[dict[str, Any]], *, state_only: bool, use_next: bool = False
 ) -> dict[str, torch.Tensor]:
@@ -482,6 +659,11 @@ def _build_obs(
     extra_view_image_keys = (
         _NEXT_EXTRA_VIEW_IMAGE_KEYS if use_next else _EXTRA_VIEW_IMAGE_KEYS
     )
+    # Reject unknown camera keys before stacking — fail loudly so unrelated
+    # cameras don't get silently dropped (MAJ-10).
+    if not state_only:
+        for position, frame in enumerate(frames):
+            _detect_unknown_camera_keys(frame, position)
     obs: dict[str, torch.Tensor] = {"states": _stack_states(frames, state_keys)}
     optional_obs = {
         "main_images": _stack_optional_obs(
@@ -533,15 +715,7 @@ def _strict_bool_from_frame(
     value = _find_value(frame, keys)
     if value is None:
         return default
-    tensor = _as_tensor(value)
-    if tensor.numel() == 0:
-        return default
-    if tensor.numel() != 1:
-        raise ValueError(
-            f"LeRobot {field_name} must be scalar per transition; "
-            f"got shape {tuple(tensor.shape)}."
-        )
-    return bool(tensor.reshape(-1)[0].item())
+    return _strict_scalar_bool(value, field_name=field_name)
 
 
 def _optional_bool(
@@ -550,15 +724,7 @@ def _optional_bool(
     value = _find_value(frame, keys)
     if value is None:
         return None
-    tensor = _as_tensor(value)
-    if tensor.numel() == 0:
-        return None
-    if tensor.numel() != 1:
-        raise ValueError(
-            f"LeRobot {field_name} terminal flag must be scalar per transition; "
-            f"got shape {tuple(tensor.shape)}."
-        )
-    return bool(tensor.reshape(-1)[0].item())
+    return _strict_scalar_bool(value, field_name=f"{field_name} terminal flag")
 
 
 def _has_terminal_metadata(frame: dict[str, Any] | None) -> bool:
@@ -576,6 +742,10 @@ def _target_owns_terminal_metadata(
 ) -> bool:
     if target_frame is None or not _has_terminal_metadata(target_frame):
         return False
+    # Reject explicit disagreements between source and target frames so we
+    # don't silently pick one side's view of the world (MAJ-11). Mismatches
+    # almost always indicate the source pipeline is buggy.
+    _check_source_target_terminal_agreement(source_frame, target_frame)
     if any(
         _find_value(target_frame, keys) is not None
         for keys in (_TERMINATION_KEYS, _TRUNCATION_KEYS)
@@ -592,6 +762,40 @@ def _target_owns_terminal_metadata(
         for keys in (_TERMINATION_KEYS, _TRUNCATION_KEYS)
     )
     return source_done is None and not source_has_split
+
+
+def _check_source_target_terminal_agreement(
+    source_frame: dict[str, Any],
+    target_frame: dict[str, Any],
+) -> None:
+    """Reject contradictory positive terminal claims between source and target.
+
+    The legacy LeRobot layout puts terminal flags on the observation-only
+    target frame, so it is common (and valid) for the source frame to leave
+    ``done=False`` as a default while the target frame asserts ``done=True``;
+    the resolver promotes the target value in that case.  What is **not**
+    valid is the opposite: a source frame that asserts a *positive* terminal
+    flag (``done=True``, ``terminated=True``, ``truncated=True``) while the
+    target frame contradicts it with ``False``.  Previously the resolver
+    would silently pick the source frame's view; we now raise to surface the
+    real producer bug.
+    """
+    for keys, field_name in (
+        (_DONE_KEYS, "done"),
+        (_TERMINATION_KEYS, "terminated"),
+        (_TRUNCATION_KEYS, "truncated"),
+    ):
+        source_value = _optional_bool(source_frame, keys, field_name=field_name)
+        target_value = _optional_bool(target_frame, keys, field_name=field_name)
+        if source_value is True and target_value is False:
+            raise ValueError(
+                f"LeRobot source and target frames disagree on '{field_name}': "
+                f"source={source_value}, target={target_value}. The source "
+                "frame claims a positive terminal flag that the target frame "
+                "contradicts; reconcile the two frames (either remove the "
+                "duplicate metadata or make both sides agree) before "
+                "conversion."
+            )
 
 
 def _validate_terminal_frame_flags(frame: dict[str, Any]) -> None:
@@ -693,13 +897,21 @@ def _reward_from_transition(
     if reward_value is not None:
         reward_tensor = _as_tensor(reward_value)
         if reward_tensor.numel() == 0:
-            return 0.0
+            raise ValueError(
+                "LeRobot reward is empty (no elements); rewards must be "
+                "scalar finite floats per transition."
+            )
         if reward_tensor.numel() != 1:
             raise ValueError(
                 "LeRobot reward must be scalar per transition; "
                 f"got shape {tuple(reward_tensor.shape)}."
             )
-        return float(reward_tensor.reshape(-1)[0].item())
+        reward_scalar = float(reward_tensor.reshape(-1)[0].item())
+        if not np.isfinite(reward_scalar):
+            raise ValueError(
+                f"LeRobot reward must be finite; got {reward_scalar!r}."
+            )
+        return reward_scalar
     success = any(
         _strict_bool_from_frame(source_frame, (key,), False, field_name=key)
         for key in _SUCCESS_KEYS
@@ -723,8 +935,27 @@ def _validate_contiguous_frame_indices(
 ) -> None:
     if not ordered_frames:
         return
-    if not all("frame_index" in frame or "index" in frame for frame in ordered_frames):
+    has_frame_index = [
+        ("frame_index" in frame or "index" in frame) for frame in ordered_frames
+    ]
+    if not any(has_frame_index):
+        # No frame declares an index — list order is the source of truth and
+        # the stable sort above preserves it.  Nothing to validate.
         return
+    if not all(has_frame_index):
+        # Mixed presence is the dangerous case (MAJ-12): frames without an
+        # index default to (episode=0, frame=0) and get silently reordered
+        # against frames that do declare one.  Raise instead of silently
+        # skipping validation.
+        missing_positions = [
+            index for index, present in enumerate(has_frame_index) if not present
+        ]
+        raise ValueError(
+            "LeRobot episode frames have inconsistent frame_index presence: "
+            "some frames declare 'frame_index' (or 'index') while others do "
+            "not. Mixed presence reorders the episode silently. Missing key "
+            f"at positions: {missing_positions}."
+        )
 
     episode_index, expected_frame_index = _frame_order(ordered_frames[0])
     for frame in ordered_frames:
@@ -779,6 +1010,20 @@ def _resolve_transition_frames(
     return source_frames, target_frames
 
 
+def _validate_terminal_reward(terminal_reward: float) -> float:
+    if not isinstance(terminal_reward, (int, float, np.integer, np.floating)):
+        raise ValueError(
+            f"terminal_reward must be a finite number; got "
+            f"type={type(terminal_reward).__name__}."
+        )
+    terminal_reward_float = float(terminal_reward)
+    if not np.isfinite(terminal_reward_float):
+        raise ValueError(
+            f"terminal_reward must be finite (not NaN/Inf); got {terminal_reward!r}."
+        )
+    return terminal_reward_float
+
+
 def lerobot_episode_to_trajectory(
     frames: Sequence[dict[str, Any]],
     *,
@@ -786,6 +1031,7 @@ def lerobot_episode_to_trajectory(
     model_weights_id: str = "lerobot",
     terminal_reward: float = 1.0,
     state_only: bool = False,
+    num_action_chunks: int = 1,
 ) -> Trajectory:
     """Convert one LeRobot-style episode into a replay-buffer trajectory.
 
@@ -793,7 +1039,24 @@ def lerobot_episode_to_trajectory(
     flags stays aligned with the source frame action. The preferred layout stores
     explicit ``next_state`` / ``next_*`` observations on each action frame. Legacy
     layouts may instead append an observation-only final frame.
+
+    Args:
+        num_action_chunks: Trailing chunk dimension to emit for
+            ``loss_mask``. LeRobot frames carry one action per step, so we
+            mark every chunk position as valid. This must match the training
+            rollout's ``actor.model.num_action_chunks``; otherwise demo +
+            rollout ``concat_batch`` raises on the trailing-dim mismatch.
+
+    Raises:
+        ValueError: If ``state``/``action``/``reward`` contain non-finite values
+            or are empty, ``terminal_reward`` is non-finite, or
+            ``num_action_chunks < 1``.
     """
+    if num_action_chunks < 1:
+        raise ValueError(
+            f"num_action_chunks must be >= 1; got {num_action_chunks}."
+        )
+    terminal_reward = _validate_terminal_reward(terminal_reward)
     ordered_frames = sorted(frames, key=_frame_order)
     _validate_contiguous_frame_indices(ordered_frames)
     source_frames, target_frames = _resolve_transition_frames(ordered_frames)
@@ -883,9 +1146,17 @@ def lerobot_episode_to_trajectory(
     _validate_obs_symmetry(curr_obs, next_obs)
 
     # LeRobot frames are single-action per step; every transition is valid.
-    # An explicit all-True mask keeps concat_batch from silently dropping the
-    # chunk loss_mask when LeRobot demos are mixed with chunked rollout data.
-    loss_mask_tensor = torch.ones_like(done_tensor)
+    # Emit loss_mask with the caller-specified ``num_action_chunks`` trailing
+    # dimension so demo batches concat cleanly with chunked-rollout batches
+    # (which produce ``loss_mask`` shaped ``[T, B, num_action_chunks]`` via
+    # ``EmbodiedRolloutResult.mark_last_step_with_loss_mask``). All chunk
+    # positions are True because LeRobot has one valid action per step.
+    loss_mask_tensor = torch.ones(
+        actions.shape[0],
+        actions.shape[1],
+        num_action_chunks,
+        dtype=torch.bool,
+    )
 
     return Trajectory(
         max_episode_length=len(source_frames),
@@ -903,6 +1174,34 @@ def lerobot_episode_to_trajectory(
     )
 
 
+def _extract_episode_index(
+    frame: dict[str, Any], frame_position: int
+) -> int | None:
+    """Return the integer ``episode_index`` for *frame* or ``None`` if absent.
+
+    Raises ``ValueError`` for present-but-invalid values (NaN, non-integer
+    float, …) so they can't silently corrupt grouping.
+    """
+    if "episode_index" not in frame:
+        return None
+    raw_value = frame["episode_index"]
+    if _is_missing_value(raw_value):
+        return None
+    scalar_value = _scalar(raw_value)
+    if scalar_value is None:
+        raise ValueError(
+            f"LeRobot frame at position {frame_position} has an unreadable "
+            f"'episode_index' value: {raw_value!r}."
+        )
+    if isinstance(scalar_value, float):
+        if not np.isfinite(scalar_value) or scalar_value != int(scalar_value):
+            raise ValueError(
+                f"LeRobot frame at position {frame_position} has a non-integer "
+                f"'episode_index' value: {raw_value!r}."
+            )
+    return int(scalar_value)
+
+
 def convert_lerobot_frames_to_trajectories(
     frames: Iterable[dict[str, Any]],
     *,
@@ -910,12 +1209,45 @@ def convert_lerobot_frames_to_trajectories(
     model_weights_id: str = "lerobot",
     terminal_reward: float = 1.0,
     state_only: bool = False,
+    num_action_chunks: int = 1,
 ) -> list[Trajectory]:
-    """Group LeRobot-style frames by episode and convert them to trajectories."""
+    """Group LeRobot-style frames by episode and convert them to trajectories.
+
+    Raises:
+        ValueError: If frames have inconsistent ``episode_index`` presence
+            (mixed present/missing would silently merge missing frames into
+            episode 0, corrupting real episode boundaries — MAJ-9).
+    """
+    terminal_reward = _validate_terminal_reward(terminal_reward)
+    frame_list = list(frames)
+    extracted_indices: list[int | None] = [
+        _extract_episode_index(frame, position)
+        for position, frame in enumerate(frame_list)
+    ]
+    has_index = [index is not None for index in extracted_indices]
+    if any(has_index) and not all(has_index):
+        # Mixed presence is the dangerous case: missing frames would default
+        # to bucket 0 and merge with real episode 0.
+        missing_positions = [
+            position
+            for position, present in enumerate(has_index)
+            if not present
+        ]
+        raise ValueError(
+            "LeRobot frames have inconsistent 'episode_index' presence: "
+            "some frames declare it while others do not. Mixed presence "
+            "silently merges the unlabelled frames into episode 0. Missing "
+            f"key at positions: {missing_positions}."
+        )
+
     grouped_frames: dict[int, list[dict[str, Any]]] = {}
-    for frame in frames:
-        episode_index = int(_scalar(frame.get("episode_index"), 0))
-        grouped_frames.setdefault(episode_index, []).append(frame)
+    for episode_index, frame in zip(extracted_indices, frame_list):
+        # When no frame declared episode_index, treat the whole batch as a
+        # single episode 0; the loader at ``load_lerobot_parquet_frames``
+        # always assigns one so this is only reachable from direct callers
+        # of ``convert_lerobot_frames_to_trajectories``.
+        bucket = 0 if episode_index is None else episode_index
+        grouped_frames.setdefault(bucket, []).append(frame)
 
     trajectories = []
     for episode_index in sorted(grouped_frames):
@@ -927,6 +1259,7 @@ def convert_lerobot_frames_to_trajectories(
                 model_weights_id=model_weights_id,
                 terminal_reward=terminal_reward,
                 state_only=state_only,
+                num_action_chunks=num_action_chunks,
             )
         )
     _validate_lerobot_trajectory_observation_schema(trajectories)
@@ -964,6 +1297,7 @@ def write_lerobot_frames_to_replay_buffer(
     model_weights_id: str = "lerobot",
     terminal_reward: float = 1.0,
     state_only: bool = False,
+    num_action_chunks: int = 1,
 ) -> None:
     """Write LeRobot-style frames into a RLinf replay-buffer checkpoint."""
     trajectories = convert_lerobot_frames_to_trajectories(
@@ -972,6 +1306,7 @@ def write_lerobot_frames_to_replay_buffer(
         model_weights_id=model_weights_id,
         terminal_reward=terminal_reward,
         state_only=state_only,
+        num_action_chunks=num_action_chunks,
     )
     if not trajectories:
         raise ValueError("No valid LeRobot episodes were converted.")
@@ -1027,6 +1362,15 @@ def _read_lerobot_parquet(
         columns = set(pq.read_schema(parquet_file).names)
     except ImportError:
         columns = None
+        # state_only without column projection would read the entire parquet
+        # (including images) into RAM and then drop columns post-hoc, which
+        # defeats the memory purpose of the mode (MAJ-13).
+        if state_only:
+            raise ImportError(
+                "state_only=True requires pyarrow to project state columns "
+                "from the parquet file without materialising image data in "
+                "RAM. Install pyarrow (e.g. `pip install pyarrow`) and retry."
+            )
 
     if columns is not None:
         _validate_required_columns(parquet_file, columns)
@@ -1040,14 +1384,6 @@ def _read_lerobot_parquet(
     else:
         table = pd.read_parquet(parquet_file)
         _validate_required_columns(parquet_file, set(table.columns))
-        if state_only:
-            table = table[
-                [
-                    column
-                    for column in _STATE_ONLY_PARQUET_KEYS
-                    if column in table.columns
-                ]
-            ]
     return table.to_dict("records")
 
 
@@ -1071,15 +1407,29 @@ def load_lerobot_parquet_frames(
     next_episode_index = 0
     for dataset_root in dataset_roots:
         parquet_files = sorted((dataset_root / "data").glob("**/*.parquet"))
+        # Tag every loaded record with its source parquet path so downstream
+        # validators can include the file in error messages (multi-parquet
+        # datasets become "bisect by hand" without it).
         root_frames: list[dict[str, Any]] = []
         for parquet_file in parquet_files:
-            root_frames.extend(
-                _read_lerobot_parquet(parquet_file, state_only=state_only)
-            )
+            file_records = _read_lerobot_parquet(parquet_file, state_only=state_only)
+            for record in file_records:
+                record["_lerobot_parquet_file"] = str(parquet_file)
+            root_frames.extend(file_records)
 
         episode_map: dict[int, int] = {}
-        for frame in sorted(root_frames, key=_frame_order):
-            local_episode_index = int(_scalar(frame.get("episode_index"), 0))
+        for position, frame in enumerate(sorted(root_frames, key=_frame_order)):
+            local_episode_index = _extract_episode_index(frame, position)
+            if local_episode_index is None:
+                # Parquet schema is validated to contain ``episode_index``
+                # above, so a None here means the column exists but holds an
+                # explicit null — reject to avoid silent merging.
+                raise ValueError(
+                    "LeRobot parquet frame at position "
+                    f"{position} (parquet_file={frame.get('_lerobot_parquet_file')}, "
+                    f"root={dataset_root}) has a null "
+                    "'episode_index'; cannot merge unlabelled frames."
+                )
             if local_episode_index not in episode_map:
                 episode_map[local_episode_index] = next_episode_index
                 next_episode_index += 1
@@ -1099,6 +1449,7 @@ def convert_lerobot_dataset_to_replay_buffer(
     model_weights_id: str = "lerobot",
     terminal_reward: float = 1.0,
     state_only: bool = False,
+    num_action_chunks: int = 1,
 ) -> None:
     """Convert a local LeRobot parquet dataset into a replay-buffer checkpoint."""
     frames = load_lerobot_parquet_frames(dataset_path, state_only=state_only)
@@ -1110,7 +1461,23 @@ def convert_lerobot_dataset_to_replay_buffer(
         model_weights_id=model_weights_id,
         terminal_reward=terminal_reward,
         state_only=state_only,
+        num_action_chunks=num_action_chunks,
     )
+
+
+def _finite_float(value: str) -> float:
+    """``argparse`` type that rejects NaN/Inf so they can't reach the buffer."""
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError) as exc:
+        raise argparse.ArgumentTypeError(
+            f"{value!r} is not a valid float."
+        ) from exc
+    if not np.isfinite(parsed):
+        raise argparse.ArgumentTypeError(
+            f"{value!r} must be finite (not NaN/Inf)."
+        )
+    return parsed
 
 
 def _parse_args() -> argparse.Namespace:
@@ -1133,13 +1500,23 @@ def _parse_args() -> argparse.Namespace:
         help="Mark frames without intervene_flag as expert/intervention data.",
     )
     parser.add_argument("--model-weights-id", default="lerobot")
-    parser.add_argument("--terminal-reward", type=float, default=1.0)
+    parser.add_argument("--terminal-reward", type=_finite_float, default=1.0)
     parser.add_argument(
         "--state-only",
         action="store_true",
         help=(
             "Ignore image fields and convert only state/action data. Use this "
             "only when the training config uses a state-only actor model."
+        ),
+    )
+    parser.add_argument(
+        "--num-action-chunks",
+        type=int,
+        default=1,
+        help=(
+            "Trailing chunk dimension for the per-step loss_mask. MUST match "
+            "the training rollout's actor.model.num_action_chunks; otherwise "
+            "demo + rollout concat fails with a trailing-dim mismatch."
         ),
     )
     return parser.parse_args()
@@ -1156,6 +1533,7 @@ def main() -> None:
         model_weights_id=args.model_weights_id,
         terminal_reward=args.terminal_reward,
         state_only=args.state_only,
+        num_action_chunks=args.num_action_chunks,
     )
 
 

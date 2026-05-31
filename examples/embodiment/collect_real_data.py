@@ -201,11 +201,27 @@ class DataCollector(Worker):
                     max_episode_length=self.cfg.env.eval.max_episode_steps,
                 )
 
-        self.buffer.close()
+        # CRIT-R5-7: ``buffer.close()`` now re-raises on async persistence
+        # failures (R2). Without ``try/finally`` an error there would skip
+        # ``self.env.close()`` and leak the Franka driver + LeRobot image
+        # writers. Best-effort drain both, surface the first error.
+        buffer_error: BaseException | None = None
+        try:
+            self.buffer.close()
+        except BaseException as exc:  # noqa: BLE001
+            buffer_error = exc
+            self.log_warning(f"buffer.close() failed: {exc!r}")
+        try:
+            self.env.close()
+        except BaseException as exc:  # noqa: BLE001
+            self.log_warning(f"env.close() failed: {exc!r}")
+            if buffer_error is None:
+                buffer_error = exc
         self.log_info(
             f"Finished. Demos saved in: {os.path.join(self.cfg.runner.logger.log_path, 'demos')}"
         )
-        self.env.close()
+        if buffer_error is not None:
+            raise buffer_error
 
 
 @hydra.main(

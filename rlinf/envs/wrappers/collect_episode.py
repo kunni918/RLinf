@@ -277,6 +277,22 @@ class CollectEpisode(gym.Wrapper):
             self._buffers[env_idx]["truncated"].append(False)
             self._buffers[env_idx]["infos"].append({})
 
+    # Auto-reset and chunk-step markers that describe the *old* episode and
+    # therefore must be scrubbed before the leftover info is stashed into the
+    # next episode's first frame.
+    _AUTO_RESET_MARKER_KEYS = (
+        "final_observation",
+        "final_info",
+        "_final_info",
+        "_final_observation",
+        "_elapsed_steps",
+        "_valid_step",
+        "terminal_chunk_index",
+        "chunk_intervene_action",
+        "chunk_intervene_flag",
+        "chunk_valid_step",
+    )
+
     def _record_step(self, action, obs, reward, terminated, truncated, info) -> None:
         """Record one transition into every env's buffer."""
         self._global_step += 1
@@ -286,11 +302,13 @@ class CollectEpisode(gym.Wrapper):
             final_observation = info["final_observation"]
             final_info_batch = info["final_info"]
             info_no_reset = copy.deepcopy(info)
-            info_no_reset.pop("final_observation")
-            info_no_reset.pop("final_info")
-            # `_valid_step` describes the old chunk; it must not carry over
-            # into the next episode's first info entry.
-            info_no_reset.pop("_valid_step", None)
+            # Strip every auto-reset / chunk-step marker before stashing the
+            # leftover info into `_pending_info`. Keys describing the old
+            # chunk (e.g. `_valid_step`, `terminal_chunk_index`, the
+            # `chunk_intervene_*` tensors and the `_final_*` mirrors written
+            # by `_handle_auto_reset`) must not seed the next episode.
+            for _scrub_key in self._AUTO_RESET_MARKER_KEYS:
+                info_no_reset.pop(_scrub_key, None)
 
         for env_idx in range(self.num_envs):
             if isinstance(info, dict) and "_valid_step" in info:
@@ -541,6 +559,11 @@ class CollectEpisode(gym.Wrapper):
                 wrist_image_keys=wrist_image_keys,
                 extra_view_image_keys=extra_view_image_keys,
                 has_intervene_flag="intervene_flag" in first,
+                # `_buffer_to_lerobot_ep` emits transition-rich frames
+                # (next_state, next_image, rewards, terminated, truncated,
+                # next_<wrist/view>) for replay-buffer conversion, so opt
+                # into the matching writer schema.
+                transition_schema=True,
             )
         return self._lerobot_writer
 
